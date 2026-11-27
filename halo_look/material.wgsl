@@ -458,7 +458,6 @@ fn material(input: MaterialInput) -> Surface {
     if pbr {
         // all reads inside the branch: with no LabPBR pack installed they cost nothing
         let spec_map = block_specular_map(input.uv);
-        n = mapped_normal(n_geo, input.tangent, block_normal_map(input.uv));
         smoothness = spec_map.r;
         // LabPBR's alpha is emission EXCEPT that exactly 255/255 means
         // "ignored" — the format's own footgun: any plain opaque map reads
@@ -482,6 +481,18 @@ fn material(input: MaterialInput) -> Surface {
         let g = spec_map.g;
         f0 = select(g, 0.9, g > 0.9 && g < 0.996);
         spec_tint = mix(vec3<f32>(1.0), input.albedo.rgb, step(0.9, g));
+        // THE COVERAGE LAW: the map arrays are filtered and mipmapped on
+        // their own, and the pack stores junk RGB behind transparent pixels
+        // (SPBR: 138 cutout sprites, dev to 255). Mips average that garbage
+        // into every distant texel and edge taps drink it, so anything that
+        // can add light rides the fraction this pixel is actually covered
+        // by the color sprite, and the normal eases to flat with the same
+        // weight (owner: "all of the grass has a highlight"). Opaque faces
+        // are coverage 1: untouched.
+        let cov = input.albedo.a;
+        f0 *= cov;
+        emission_map *= cov;
+        n = normalize(mix(n_geo, mapped_normal(n_geo, input.tangent, block_normal_map(input.uv)), cov));
     }
 
     // vanilla's lit colour, in linear light
