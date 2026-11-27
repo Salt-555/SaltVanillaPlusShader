@@ -405,7 +405,15 @@ fn material(input: MaterialInput) -> Surface {
             // `mirror` already holds sky_gradient(r): reuse it, don't re-derive it
             mirror = mix(m, mirror, max(grazing * 0.45, 1.0 - on_plane));
         }
-        color = mix(foamy, mirror, fres_m);
+        // THE SKY-OPEN LAW (owner, 0.17.11: "water doesnt reflect if it is
+        // under ground"): the mirror - engine plane image or the pack's own
+        // sky_gradient fallback - depicts OPEN SKY, and a cave pool is not
+        // under open sky no matter what the ray points at. Skylight is the
+        // engine's own sky-visibility measurement, the same field the
+        // shines below already gate on; the mirror's weight rides it, so a
+        // sealed pool goes matte and a pool one block from a skyhole keeps
+        // the reflection its light actually receives.
+        color = mix(foamy, mirror, fres_m * input.light.y);
 
         // The sun-directed water terms all carry input.light.y (crest transmission, the
         // glint, the sparkle): where skylight is exactly zero — cave pools, Nether water,
