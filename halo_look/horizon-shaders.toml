@@ -1,7 +1,7 @@
 schema = 1
 id = "halo_look"
 name = "Halo Look"
-version = "0.16.46"
+version = "0.16.47"
 api = "0.2"
 description = "Sun shadows from a shadow map, LabPBR surfaces, spectral water with absorption and foam, coloured block light, wind on leaves and plants, sun and moon shafts, aurora and lightning, ground fog, bloom, film grain, and an ACES filmic curve. Heavy sampling at half and quarter resolution. No ray tracing."
 authors = ["Artemis"]

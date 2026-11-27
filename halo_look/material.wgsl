@@ -481,17 +481,29 @@ fn material(input: MaterialInput) -> Surface {
         let g = spec_map.g;
         f0 = select(g, 0.9, g > 0.9 && g < 0.996);
         spec_tint = mix(vec3<f32>(1.0), input.albedo.rgb, step(0.9, g));
-        // THE COVERAGE LAW: the map arrays are filtered and mipmapped on
-        // their own, and the pack stores junk RGB behind transparent pixels
-        // (SPBR: 138 cutout sprites, dev to 255). Mips average that garbage
-        // into every distant texel and edge taps drink it, so anything that
-        // can add light rides the fraction this pixel is actually covered
-        // by the color sprite, and the normal eases to flat with the same
-        // weight (owner: "all of the grass has a highlight"). Opaque faces
-        // are coverage 1: untouched.
-        let cov = input.albedo.a;
+        // THE EMISSION GATE (owner: "the grass still has lime green bright
+        // edges as if lit up even in midnight"): a cutout sprite's _s alpha
+        // is 255 on the blade / 0 behind it, neither is emission, and linear
+        // filtering blends them to a mid alpha along every seam that the
+        // alpha rule then reads as real, blade-tinted glow — with no sun
+        // gate, so it blazes at midnight. A coverage gate on the color's own
+        // alpha CANNOT catch it: a blade texel is fully opaque (alpha 1); the
+        // map bled via filtering while the color did not. The discriminator
+        // is the block's own light level: a pack's per-texel emission is
+        // detail on a block that ALREADY emits (a torch 0.93, glowstone/magma/
+        // lantern 1), never a way to make grass or stone glow. Scaling map
+        // emission by input.emission zeroes it on every non-emissive block —
+        // grass, leaves, flowers, saplings — regardless of how their maps
+        // filtered, and keeps every real emitter's glow in full.
+        emission_map *= input.emission;
+        // THE COVERAGE LAW: map arrays filter and mipmap on their own and
+        // the pack stores junk behind transparent texels (SPBR: 138 cutout
+        // sprites), which mips average into distance and edge taps drink, so
+        // the highlight strength and the normal ease toward flat with the
+        // coverage the color sprite actually paints (owner: "all of the grass
+        // has a highlight"). Opaque faces are coverage 1: untouched.
+        let cov = smoothstep(0.5, 0.9, input.albedo.a);
         f0 *= cov;
-        emission_map *= cov;
         n = normalize(mix(n_geo, mapped_normal(n_geo, input.tangent, block_normal_map(input.uv)), cov));
     }
 
