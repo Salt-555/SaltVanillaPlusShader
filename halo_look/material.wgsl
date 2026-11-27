@@ -4,6 +4,7 @@
 // without turning on terrain look storage (no world reload, no extra terrain memory).
 override specular: f32 = 0.8;
 override sss_back: f32 = 1.0;
+override pbr_relief: f32 = 0.25;
 override reflections: bool = true;
 override water_waves: f32 = 1.0;
 override wave_bend: f32 = 4.0;
@@ -116,6 +117,15 @@ fn wave_field(q: vec2<f32>, shore_phase: f32, ch: f32, sh: f32) -> vec4<f32> {
                      (sh * WF_CC[6u] + ch * WF_CS[6u]) * sl6,
                      sn6 * 0.0173500906676054 * en6);
     return vec4<f32>(acc.x, acc.y, 0.0, acc.z) * group;
+}
+
+// SPBR heights are geometry near the camera; the engine replaces the
+// flat face with this grid inside the reach, pins face edges at the
+// texture's mean height itself, and needs a REAL depth - at zero the
+// grid's own coplanar cells z-fight. Runs in a vertex context: input
+// and the menu only.
+fn displacement(input: DisplacementInput) -> f32 {
+    return (1.0 - input.height) * pbr_relief;
 }
 
 fn material(input: MaterialInput) -> Surface {
