@@ -164,10 +164,22 @@ fn post(input: PostInput) -> vec4<f32> {
     // already loaded. The guard keeps flat block interiors (where the high-pass is only
     // texture noise and dither) out of it, so it sharpens edges and detail, not crunch.
     if clarity > 0.001 {
-        let detail = c - (cn + cs + cw + ce) * 0.25;
-        let peak = max(max(detail.r, detail.g), detail.b);
+        let nbr = (cn + cs + cw + ce) * 0.25;
+        let detail = c - nbr;
+        // Halo guard: a high-pass's NEGATIVE half is what carves dark rims
+        // on the dark side of a bright edge, and the brighter the lit side
+        // the deeper the carve - unsharp masks halo worst beside haze,
+        // shafts and sunlit sky (owner, beside brighter 0.17.6 shafts:
+        // "a darkness around them before the haze applies"). Taper the
+        // negative half by the neighborhood's own luminance; positive
+        // detail - the bright overshoot that IS the sharpening - keeps its
+        // old law untouched.
+        let neg_taper = mix(1.0, 0.35, smoothstep(0.5, 2.0, luma(nbr)));
+        let detail_f = detail * select(vec3<f32>(1.0), vec3<f32>(neg_taper),
+                                       detail < vec3<f32>(0.0));
+        let peak = max(max(detail_f.r, detail_f.g), detail_f.b);
         let guard = clamp((peak - 0.015) * 8.0, 0.0, 1.0);
-        c += detail * clarity * guard;
+        c += detail_f * clarity * guard;
     }
 
     if vignette {
