@@ -3,6 +3,8 @@
 // `shaded_tint` is the free path: it carries vanilla's tint, shade and ambient occlusion
 // without turning on terrain look storage (no world reload, no extra terrain memory).
 override specular: f32 = 0.8;
+override sss_back: f32 = 1.0;
+override pbr_relief: f32 = 0.0;
 override reflections: bool = true;
 override water_waves: f32 = 1.0;
 override wave_bend: f32 = 4.0;
@@ -115,6 +117,14 @@ fn wave_field(q: vec2<f32>, shore_phase: f32, ch: f32, sh: f32) -> vec4<f32> {
                      (sh * WF_CC[6u] + ch * WF_CS[6u]) * sl6,
                      sn6 * 0.0173500906676054 * en6);
     return vec4<f32>(acc.x, acc.y, 0.0, acc.z) * group;
+}
+
+// SPBR heights are geometry near the camera. The engine pins face edges
+// at the texture's mean height itself (it evaluates this same function
+// there), so only the shape matters; without LabPBR maps no face is ever
+// grid-cut. Runs in a vertex context: input and the menu only.
+fn displacement(input: DisplacementInput) -> f32 {
+    return (1.0 - input.height) * pbr_relief;
 }
 
 fn material(input: MaterialInput) -> Surface {
@@ -452,9 +462,11 @@ fn material(input: MaterialInput) -> Surface {
     let pbr = block_pbr_maps();
     var n = n_geo;
     var smoothness = 0.0;
-    var f0 = 0.0;
-    var spec_tint = vec3<f32>(1.0);
+    var f0 = vec3<f32>(0.0);
+    var metal_damp = vec3<f32>(1.0);
     var emission_map = 0.0;
+    var sss = 0.0;
+    var porosity = 0.0;
     if pbr {
         // all reads inside the branch: with no LabPBR pack installed they cost nothing
         let spec_map = block_specular_map(input.uv);
@@ -475,12 +487,17 @@ fn material(input: MaterialInput) -> Surface {
         // half-strength broad lobe regardless of what the material is — the
         // tonemap clipped that to pale (owner: "everything gettin hit by the
         // sun is mad washed out"). SPBR ships stone/dirt/wood at F0 0, so
-        // those faces now add nothing. Preset metals share one strength and
-        // take the albedo as their highlight tint per the metal convention;
-        // the per-metal N/K tables are not modeled.
+        // those faces now add nothing. Metal bands per the format: 230-254
+        // are preset metals — one shared strength, albedo as the F0 COLOR —
+        // and 255 says the albedo IS the F0 per channel. Metals pay for
+        // their reflectance out of their diffuse (metal_damp): a metal's
+        // color belongs in its reflection, not its matte shading. The
+        // per-metal N/K tables are still not modeled.
         let g = spec_map.g;
-        f0 = select(g, 0.9, g > 0.9 && g < 0.996);
-        spec_tint = mix(vec3<f32>(1.0), input.albedo.rgb, step(0.9, g));
+        f0 = vec3<f32>(g);
+        if (g > 0.9) { f0 = input.albedo.rgb * 0.9; }
+        if (g > 0.999) { f0 = input.albedo.rgb; }
+        metal_damp = mix(vec3<f32>(1.0), vec3<f32>(1.0) - f0, step(229.0 / 255.0, g));
         // THE EMISSION GATE (owner: "the grass still has lime green bright
         // edges as if lit up even in midnight"): a cutout sprite's _s alpha
         // is 255 on the blade / 0 behind it, neither is emission, and linear
@@ -504,12 +521,18 @@ fn material(input: MaterialInput) -> Surface {
         // has a highlight"). Opaque faces are coverage 1: untouched.
         let cov = smoothstep(0.5, 0.9, input.albedo.a);
         f0 *= cov;
+        // THE BLUE BAND, split by value like the format says: 0-64 is
+        // porosity (how thirsty the material is), 65-255 is subsurface
+        // translucence. One byte is never both. Both ride coverage: the
+        // junk behind cutout texels is full-range in every channel.
+        sss = clamp((spec_map.b - 65.0 / 255.0) * (255.0 / 190.0), 0.0, 1.0) * cov;
+        porosity = select(spec_map.b * (255.0 / 64.0), 0.0, spec_map.b > 64.0 / 255.0) * cov;
         n = normalize(mix(n_geo, mapped_normal(n_geo, input.tangent, block_normal_map(input.uv)), cov));
     }
 
     // vanilla's lit colour, in linear light
     let base = input.albedo.rgb * input.shaded_tint.rgb;
-    var color = base * input.lightmap;
+    var color = base * input.lightmap * metal_damp;
 
     // coloured block light: shift the hue of the block-lit part, keep its brightness
     // the light grid is a trilinear 3D sample, eight fetches: skip it where no block
@@ -533,12 +556,24 @@ fn material(input: MaterialInput) -> Surface {
         // the gate that the surface is block-lit at all.
         let near = sqrt(min(cl.a, 1.0));
         let tint = mix(vec3<f32>(1.0), cl.rgb, near * colored_light);
-        color += base * near * gf * (tint - vec3<f32>(1.0));
+        color += base * metal_damp * near * gf * (tint - vec3<f32>(1.0));
     }
     // the engine's carried block lights — held and dropped items, and any
     // [[particle_lights]] or mod lights upstream — ride in as a hue shift
     if any(input.colored_light > vec3<f32>(0.0)) {
         color = mix(color, color * (vec3<f32>(1.0) + input.colored_light), 0.5);
+    }
+
+    // Rain on porous material (LabPBR blue 0-64): damp darkens the albedo
+    // and a thin water film smooths the surface toward a mirror sheen.
+    // frame.wetness is the engine's smoothed rain state — 0 when dry, and
+    // porosity is 0 without maps, so either alone makes this free.
+    // Before the highlight block: the smoothing must ride the same
+    // smoothness the sun lobe is cut from.
+    let wet = clamp(frame.wetness * porosity, 0.0, 1.0);
+    if wet > 0.0 {
+        color *= mix(vec3<f32>(1.0), vec3<f32>(0.62), wet);
+        smoothness = min(smoothness + (1.0 - smoothness) * wet, 1.0);
     }
 
     // the sun's or moon's highlight where the sky reaches the surface
@@ -551,11 +586,29 @@ fn material(input: MaterialInput) -> Surface {
         // the strength. A gate on f0 > 0.0 skips zero-F0 sprites wholesale —
         // the skipped face's continuation is exactly what an F0 of 0 added,
         // so no boundary can render.
-        if smoothness > 0.02 && f0 > 0.0 {
+        if smoothness > 0.02 && max3(f0) > 0.0 {
             let sun_tint = mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.35);
             let glint = shine(n, light_dir, view, smoothness) * input.light.y * specular;
-            color += spec_tint * (glint * f0 * 0.5) * sun_tint;
+            // Schlick: F0 is the head-on share; grazing angles mirror more.
+            let hv = max(dot(normalize(light_dir + view), view), 0.0);
+            let f_ang = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - hv, 5.0);
+            color += glint * 0.5 * f_ang * sun_tint;
         }
+    }
+
+    // LabPBR's subsurface: the sun shining through a translucent
+    // surface toward the eye (blue 65-255 = the fraction). Two gates
+    // beyond the sun: the FACE must point away from the sun (a
+    // backlit side is what transmission is), or every upward lawn
+    // facing a low sun gets a flat albedo add — washed-out grass,
+    // shipped 0.17.0, owner: "grass and leaves seem washed out".
+    // And the add is half-rate: it is a highlight through leaves,
+    // not a second sun. Lava and water carry their own light.
+    if sss > 0.0 && sss_back > 0.0 && light_dir.y > 0.0 && input.fluid == 0u {
+        let backlit = max(-dot(n, light_dir), 0.0);
+        let back = max(dot(light_dir, -view), 0.0);
+        let trans = pow(back, 4.0) * backlit * sss * sss_back * 0.5 * input.light.y;
+        color += input.albedo.rgb * mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.35) * trans;
     }
 
     // LabPBR's per-texel emission: glowing ore, a lamp's filament

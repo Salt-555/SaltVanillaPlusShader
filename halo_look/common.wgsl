@@ -28,6 +28,9 @@ fn fresnel_schlick(cos_t: f32, f0: f32) -> f32 {
     return f0 + (1.0 - f0) * m2 * m2 * m;
 }
 
+// Largest component of a vector (a vec3's "any strength").
+fn max3(v: vec3<f32>) -> f32 { return max(v.x, max(v.y, v.z)); }
+
 // Blinn-Phong highlight, roughness as a perceptual smoothness (LabPBR's r).
 fn shine(n: vec3<f32>, l: vec3<f32>, v: vec3<f32>, smoothness: f32) -> f32 {
     let rough = (1.0 - smoothness) * (1.0 - smoothness);

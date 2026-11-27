@@ -1,7 +1,7 @@
 schema = 1
 id = "halo_look"
 name = "Halo Look"
-version = "0.16.47"
+version = "0.17.1"
 api = "0.2"
 description = "Sun shadows from a shadow map, LabPBR surfaces, spectral water with absorption and foam, coloured block light, wind on leaves and plants, sun and moon shafts, aurora and lightning, ground fog, bloom, film grain, and an ACES filmic curve. Heavy sampling at half and quarter resolution. No ray tracing."
 authors = ["Artemis"]
@@ -20,6 +20,10 @@ name = "Wind"
 file = "material.wgsl"
 name = "Surface light"
 reads = ["wave_clock"]
+
+[displacement]
+distance = 12.0
+cells = 16
 
 [shadow]
 resolution = 1024
@@ -216,6 +220,26 @@ default = 0.8
 min = 0.0
 max = 2.0
 step = 0.05
+
+[[options]]
+id = "sss_back"
+name = "Sun through leaves"
+description = "Backlight where a texture pack marks a surface translucent: foliage and flowers glow when the sun is behind them. Needs LabPBR maps; silent without."
+type = "float"
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.1
+
+[[options]]
+id = "pbr_relief"
+name = "Surface relief"
+description = "How deep a texture pack's heights carve block faces near you. Needs a pack with height maps; changes nothing without one. 0 still pays the extra draw."
+type = "float"
+default = 0.0
+min = 0.0
+max = 0.25
+step = 0.01
 
 [[options]]
 id = "ore_glow"
@@ -512,7 +536,7 @@ items = ["page:light", "page:colour", "page:water", "page:world"]
 id = "light"
 name = "Light and shadow"
 description = "The sun's shadow, contact shading, sun shafts, specular and the ores' self-light. Shadow resolution and distance are the two that cost frames."
-items = ["shadows", "shadow_resolution", "shadow_distance", "shadow_softness", "contact_ao", "god_rays", "moon_shafts", "specular", "ore_glow"]
+items = ["shadows", "shadow_resolution", "shadow_distance", "shadow_softness", "contact_ao", "god_rays", "moon_shafts", "specular", "sss_back", "pbr_relief", "ore_glow"]
 
 [[pages]]
 id = "colour"
