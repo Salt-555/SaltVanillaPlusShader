@@ -460,7 +460,16 @@ fn material(input: MaterialInput) -> Surface {
         let spec_map = block_specular_map(input.uv);
         n = mapped_normal(n_geo, input.tangent, block_normal_map(input.uv));
         smoothness = spec_map.r;
-        emission_map = spec_map.a;
+        // LabPBR's alpha is emission EXCEPT that exactly 255/255 means
+        // "ignored" — the format's own footgun: any plain opaque map reads
+        // as full emission if the rule isn't applied. The engine passes the
+        // maps through raw (the generated sampler is a passthrough; "1 none"
+        // is convention, not runtime), so the decode is the pack's job:
+        // up to 254/255 scales linearly, 255 is none. SPBR ships alpha 255
+        // on every non-emissive block; unruled, every face added half its
+        // albedo at all hours and nothing stayed dark (owner: "the dark
+        // areas are no longer dark at all").
+        emission_map = select(spec_map.a, 0.0, spec_map.a > 0.998);
         // LabPBR green is the reflectance: F0 up to 229/255 for dielectrics,
         // 230-254 the preset metals, 255 the albedo-as-F0 metal. Every
         // highlight must ride it. Reading only red gave every sunlit face a
