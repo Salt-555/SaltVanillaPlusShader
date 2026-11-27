@@ -116,6 +116,17 @@ fn post(input: PostInput) -> vec4<f32> {
     mn = mn - vec3<f32>(0.004);
     mx = mx + vec3<f32>(0.004);
     hist = clamp(hist, mn, mx);
+    // Disagreement eviction (the anti-ghost gate): the box forgives anything
+    // inside a lit neighborhood, so a stale bright column from a MOVED
+    // occluder - near parallax the reprojection law cannot model, admitted up
+    // top - survives inside the box for the full ~13-frame convergence and
+    // reads as a ghost trailing the object (owner, 0.17.7). Where the raw
+    // march flatly contradicts history at this very cell, drop the history
+    // weight outright: the flush takes ~2 frames instead of 13. Scaled by
+    // RELATIVE disagreement so the jitter-noisy raw frame of a faint beam
+    // doesn't evict its own accumulation: stable beams keep every frame.
+    let dis = max3(abs(hist - cur)) / (max3(max(hist, cur)) + 0.15);
+    keep *= 1.0 - smoothstep(0.25, 0.6, dis);
     // 22% fresh per 60fps frame: 0.78^14 = 3% residue — ~thirteen frames to
     // 96% at any frame rate, by construction.
     return vec4<f32>(mix(cur, hist, keep), 1.0);
