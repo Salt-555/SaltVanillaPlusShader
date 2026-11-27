@@ -1,8 +1,11 @@
-# Halo Look 0.17.4
+# Halo Look 0.17.5
 
 A Horizon shader pack (shader API 0.2, WGSL) for the Strix Halo APU. No ray tracing: the
 shadow is a shadow map, the water mirror is a planar reflection, everything else is
-screen-space or analytic. Written against `docs/shaders.md` and
+screen-space or analytic. With a LabPBR texture pack (SPBR tested) it decodes the format
+fully: vector-F0 metals, sun backlight through translucent foliage, rain-darkened porous
+materials, per-texel emission, and optional height relief geometry near the camera.
+Written against `docs/shaders.md` and
 `docs/api/shaders-reference-0.2.md` in the Horizon tree.
 
 ## Stages
@@ -152,7 +155,7 @@ square is drawn again each frame).
 ## Build, check, install
 
     horizon-shader check .
-    horizon-shader pack .          # writes halo_look-0.17.4.hshader
+    horizon-shader pack .          # writes halo_look-0.17.5.hshader
 
 Copy the folder or the `.hshader` into `shaderpacks/` beside `options.txt`.
 `HORIZON_SHADER_PACK=halo_look` forces it for development. A saved pack is re-checked twice a

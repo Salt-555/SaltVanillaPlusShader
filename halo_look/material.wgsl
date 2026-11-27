@@ -5,6 +5,7 @@
 override specular: f32 = 0.8;
 override sss_back: f32 = 1.0;
 override pbr_relief: f32 = 0.25;
+override surface_geometry: bool = false;
 override reflections: bool = true;
 override water_waves: f32 = 1.0;
 override wave_bend: f32 = 4.0;
@@ -498,7 +499,15 @@ fn material(input: MaterialInput) -> Surface {
         f0 = vec3<f32>(g);
         if (g > 0.9) { f0 = input.albedo.rgb * 0.9; }
         if (g > 0.999) { f0 = input.albedo.rgb; }
-        metal_damp = mix(vec3<f32>(1.0), vec3<f32>(1.0) - f0, step(229.0 / 255.0, g));
+        // Damp is a SCALAR on the F0's luma with a floor (review,
+        // measured on SPBR: (1-F0) per channel left gold and copper
+        // matte shading tinted with their own COMPLEMENT - cyan
+        // residue - and iron at 0.137 reads black in a forward pass
+        // with no env reflection to pay back the traded energy).
+        // One law for both metal bands; band starts at 230, not 229.
+        metal_damp = mix(vec3<f32>(1.0),
+                         vec3<f32>(max(1.0 - max3(f0), 0.25)),
+                         step(229.5 / 255.0, g));
         // THE EMISSION GATE (owner: "the grass still has lime green bright
         // edges as if lit up even in midnight"): a cutout sprite's _s alpha
         // is 255 on the blade / 0 behind it, neither is emission, and linear
@@ -526,7 +535,7 @@ fn material(input: MaterialInput) -> Surface {
         // porosity (how thirsty the material is), 65-255 is subsurface
         // translucence. One byte is never both. Both ride coverage: the
         // junk behind cutout texels is full-range in every channel.
-        sss = clamp((spec_map.b - 65.0 / 255.0) * (255.0 / 190.0), 0.0, 1.0) * cov;
+        sss = min(clamp((spec_map.b - 65.0 / 255.0) * (255.0 / 190.0), 0.0, 1.0), 0.6) * cov;
         porosity = select(spec_map.b * (255.0 / 64.0), 0.0, spec_map.b > 64.0 / 255.0) * cov;
         n = normalize(mix(n_geo, mapped_normal(n_geo, input.tangent, block_normal_map(input.uv)), cov));
     }
@@ -571,7 +580,12 @@ fn material(input: MaterialInput) -> Surface {
     // porosity is 0 without maps, so either alone makes this free.
     // Before the highlight block: the smoothing must ride the same
     // smoothness the sun lobe is cut from.
-    let wet = clamp(frame.wetness * porosity, 0.0, 1.0);
+    let wet = clamp(frame.wetness * porosity, 0.0, 1.0)
+            // wetness is ONE global weather scalar with no position
+            // (review): gate it to actual rain (not snow) falling on
+            // surfaces that can see the sky, or caves and covered
+            // floors darken in a storm.
+            * step(0.1, input.light.y) * select(0.0, 1.0, frame.precipitation == 1u);
     if wet > 0.0 {
         color *= mix(vec3<f32>(1.0), vec3<f32>(0.62), wet);
         smoothness = min(smoothness + (1.0 - smoothness) * wet, 1.0);
@@ -605,15 +619,24 @@ fn material(input: MaterialInput) -> Surface {
     // shipped 0.17.0, owner: "grass and leaves seem washed out".
     // And the add is half-rate: it is a highlight through leaves,
     // not a second sun. Lava and water carry their own light.
-    if sss > 0.0 && sss_back > 0.0 && light_dir.y > 0.0 && input.fluid == 0u {
-        let backlit = max(-dot(n, light_dir), 0.0);
-        let back = max(dot(light_dir, -view), 0.0);
-        let trans = pow(back, 4.0) * backlit * sss * sss_back * 0.5 * input.light.y;
-        // The light passing through is SUNlight, not skylight: a warm
-        // white. The pack's sky_color-tinted convention reads blue on a
-        // broad glow (owner: "the glow through the trees is also
-        // blueish"); the leaf's own color comes in via albedo anyway.
-        color += input.albedo.rgb * vec3<f32>(1.0, 0.86, 0.66) * trans;
+    // LabPBR's subsurface: SUNlight through a translucent surface
+    // toward the eye (blue 65-255 = the fraction). Sun-specific vectors
+    // — frame.light_direction is the MOON by night, and a warm-white
+    // moonlit transmission glow is wrong (review: leaves glowed at
+    // midnight). sun_direction goes below the horizon at night, which
+    // is this block's off switch; the y ramp fades it at dawn/dusk.
+    // Gates: the FACE must point away from the sun (backlit is what
+    // transmission is — the wash-out fix), input.light.y keeps caves
+    // and covered spots out, fluids carry their own light.
+    if sss > 0.0 && sss_back > 0.0 && input.fluid == 0u {
+        let sun = frame.sun_direction;
+        let day = clamp(sun.y * 6.0, 0.0, 1.0);
+        if day > 0.0 {
+            let backlit = max(-dot(n, sun), 0.0);
+            let back = max(dot(sun, -view), 0.0);
+            let trans = pow(back, 4.0) * backlit * sss * sss_back * 0.5 * day * input.light.y;
+            color += input.albedo.rgb * vec3<f32>(1.0, 0.86, 0.66) * trans;
+        }
     }
 
     // LabPBR's per-texel emission: glowing ore, a lamp's filament
