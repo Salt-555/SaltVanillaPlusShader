@@ -605,8 +605,19 @@ fn material(input: MaterialInput) -> Surface {
             let sun_tint = mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.35);
             let glint = shine(n, light_dir, view, smoothness) * input.light.y * specular;
             // Schlick: F0 is the head-on share; grazing angles mirror more.
+            // The grazing RAMP is scaled by F0 itself (to 3x) rather than
+            // the textbook (1-F0): pure Schlick's largest boost goes to
+            // F0 = 0 - and SPBR ships wood at F0 = 11/255 (measured from
+            // acacia/birch _s: green ~11) - the near-maximum grey ramp on
+            // every log. A sun-only forward pass with no environment to
+            // answer for it renders that as a grey gradient across every
+            // log face (owner, 0.17.10: "a gradient of grey on all of the
+            // logs"). Dielectrics keep a sheen proportional to what they
+            // actually mirror (11/255 x 3 = a whisper); the metal bands
+            // (F0 >= .9) saturate the cap at 3x and are untouched.
             let hv = max(dot(normalize(light_dir + view), view), 0.0);
-            let f_ang = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - hv, 5.0);
+            let graze = min(f0 * 3.0, vec3<f32>(1.0));
+            let f_ang = f0 + graze * pow(1.0 - hv, 5.0);
             color += glint * 0.5 * f_ang * sun_tint;
         }
     }
