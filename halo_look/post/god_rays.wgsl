@@ -48,7 +48,8 @@ fn post(input: PostInput) -> vec4<f32> {
     // never stretches with the aspect ratio.
     let dir = ray_dir(input.uv);
     let mu = dot(dir, light);
-    let k = 0.68;
+    // k, the floor and the renorm ride the shared LOBE_* constants (common.wgsl) so the
+    // history's mirror of this gate can never drift, and arrive folded: a cube, not pow.
     // The Schlick form never reaches zero: pointing straight away from the light
     // it still pays ((1-k)/(1+k))^3 ≈ 0.0068. Times the night strength that floor
     // sits right at the bail threshold, and a hard cut there would draw a ring of
@@ -56,8 +57,8 @@ fn post(input: PostInput) -> vec4<f32> {
     // from the caster, so the ring's inside is the hazy side). Subtract the floor
     // and renormalize: the lobe closes clean and smooth, and the bail only ever
     // fires where the term is already invisible.
-    let floor_ = pow((1.0 - k) / (1.0 + k), 3.0);
-    let glow = (pow((1.0 - k) / max(1.0 - k * mu, 0.02), 3.0) - floor_) / (1.0 - floor_);
+    let lw = 0.32 / max(1.0 - LOBE_K * mu, 0.02);
+    let glow = (lw * lw * lw) * LOBE_C1 - LOBE_C0;
     // Pixels the light barely reaches forward cannot pay for a march: bail BEFORE
     // any depth or shadow traffic. Sun behind the camera lands here. But the bail
     // itself must not draw: a hard cut sits at a fixed angle from the light and
@@ -80,11 +81,18 @@ fn post(input: PostInput) -> vec4<f32> {
     // block, and the lit fan bleeds across it on upsample. Stop at the nearest
     // of the cell's four corner texels, so the march can never pass a solid
     // surface that sits inside its own pixel.
-    let off = vec2<f32>(1.5) / frame.resolution;
-    var d_stop = 1.0e9;
+    // Distances squared, one square root at the end. view_position is view_inverse *
+    // (projection_inverse * clip) with view_inverse a PURE ROTATION (camera.rs view_matrix:
+    // a quaternion, no translation; bob and spin ride the projection) — rotations preserve
+    // length, and every candidate is non-negative, so min-of-squared picks the same corner
+    // as min-of-length. Saves four 4x4 products, four vec3 divides and a sqrt per corner.
+    var sq_stop = 1.0e18;
     if !over_sky {
-        d_stop = length(view_position(input.uv, depth));
+        let cv0 = frame.projection_inverse * vec4<f32>(input.uv.x * 2.0 - 1.0,
+                                                       1.0 - input.uv.y * 2.0, depth, 1.0);
+        sq_stop = dot(cv0.xyz, cv0.xyz) / (cv0.w * cv0.w);
     }
+    let off = vec2<f32>(1.5) / frame.resolution;
     let corners = array<vec2<f32>, 4>(
         clamp(input.uv + vec2<f32>(-off.x, -off.y), vec2<f32>(0.0), vec2<f32>(1.0)),
         clamp(input.uv + vec2<f32>(off.x, -off.y), vec2<f32>(0.0), vec2<f32>(1.0)),
@@ -94,11 +102,13 @@ fn post(input: PostInput) -> vec4<f32> {
     for (var i = 0; i < 4; i++) {
         let d = depth_at(corners[i]);
         if d != 0.0 {
-            d_stop = min(d_stop, length(view_position(corners[i], d)));
+            let cv = frame.projection_inverse * vec4<f32>(corners[i].x * 2.0 - 1.0,
+                                                          1.0 - corners[i].y * 2.0, d, 1.0);
+            sq_stop = min(sq_stop, dot(cv.xyz, cv.xyz) / (cv.w * cv.w));
         }
     }
     let reach = frame.shadow_distance * 1.4;
-    let march = min(d_stop, reach);
+    let march = min(sqrt(sq_stop), reach);
     if march < 0.5 {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);    // face planted in a block
     }
@@ -112,12 +122,14 @@ fn post(input: PostInput) -> vec4<f32> {
         // texel*(0.5+1.5*tan a), so this is conservative at mid angles and
         // under-biased past ~16 blocks, where edge texels run up to 4x coarser.
         let bias = light * (texel * 1.5);
-        // Per-pixel start offset seeded from the pass's own pixel grid (the
-        // manifest's 0.25 scale), hashed with the golden-ratio R2 pair: its
+        // Per-pixel start offset seeded from the pass's own pixel grid — input.pixel
+        // IS that grid, bijective at any pass size (the old uv*scale formula collapsed
+        // two cells onto one seed whenever the quarter was not integral) — hashed with
+        // the golden-ratio R2 pair: its
         // coordinate ratio is irrational, so no integer stride can fold the
         // seeds onto a screen lattice (the fixed 1920x1080 grid aliased into a
         // visible hatch at this pass's real 960x540 size on a 4K window).
-        let pp = floor(input.uv * frame.resolution * 0.25) + 0.5;
+        let pp = input.pixel;
         let jitter = fract(52.9829189 * fract(dot(pp, vec2<f32>(0.7548776662, 0.5698403028))));
         // Per-frame golden-ratio stride on top of the per-pixel seed: successive
         // frames sample different sub-step positions, so what the history
@@ -143,21 +155,40 @@ fn post(input: PostInput) -> vec4<f32> {
         let z_texel = abs(shadow_position(light * texel_world).z - z0) * 2.5;
         let z_step = abs(shadow_position(dir * step_len).z - z0);
         let ramp = max(max(z_texel, z_step), 1.0e-6);
+        let inv_ramp = 1.0 / ramp;      // sixteen divides by one loop-invariant
+                                        // denominator: pay it once (V3)
+        // The shadow camera is ORTHOGRAPHIC (native_shadow.rs), so the clip map is
+        // affine in the step point: clip = s * (M * (dir*step_len, 0)) + (M * (bias, 1)).
+        // Two products per cell replace four per-loop matrix multiplies; the re-
+        // association moves clip by ~1e-5 blocks against a ~0.11-block centre texel,
+        // far under the ramp (which is at least one march step wide).
+        let vstep = dir * step_len;
+        let q_dir = frame.shadow_view_proj * vec4<f32>(vstep, 0.0);
+        let q_base = frame.shadow_view_proj * vec4<f32>(bias, 1.0);
+        let kd = frame.shadow_distortion;
+        let omk = 1.0 - kd;
+        let daxis = max(abs(dir.x), abs(dir.z));
         let dims = vec2<i32>(textureDimensions(shadow_map));
         var lit_sum = 0.0;
         for (var i = 0u; i < 4u; i = i + 1u) {
             let fi = f32(i);
             // Per-step offsets decorrelate the coverage samples, so the mean
             // converges instead of flipping in lockstep along a contour.
-            let t = (fi + fract(seed + fi * 0.6180339887)) * step_len;
-            let p = dir * t;
-            let sp = shadow_position(p + bias);
+            let s = fi + fract(seed + fi * 0.6180339887);
+            let t = s * step_len;
+            let clip = q_dir * s + q_base;
+            // shadow_position + shadow_distort inline (SHADOW_HELPERS, stages.rs), with
+            // the vector divide one reciprocal-multiply and max(abs) on the scaled ray.
+            let dw = 1.0 / (length(clip.xy) * kd + omk);
+            let spx = clip.x * dw * 0.5 + 0.5;
+            let spy = 0.5 - clip.y * dw * 0.5;
+            let spz = min(clip.z, 1.0);
             // 2x2 bilinear coverage. The compare tap filtered a 2x2 footprint with
             // hardware PCF; one nearest texel put that lattice back at full
             // contrast. Four loads, bilinear weights on the fractional position:
             // the coverage field goes C0 across the map instead of an equal-weight
             // box, so texel cells stop showing as steps.
-            let u = sp.xy * vec2<f32>(dims) - vec2<f32>(0.5);
+            let u = vec2<f32>(spx, spy) * vec2<f32>(dims) - vec2<f32>(0.5);
             let b = vec2<i32>(floor(u));
             let f = u - vec2<f32>(b);
             let hi = dims - vec2<i32>(1, 1);
@@ -165,17 +196,17 @@ fn post(input: PostInput) -> vec4<f32> {
             let d1 = textureLoad(shadow_map, clamp(b + vec2<i32>(1, 0), vec2<i32>(0), hi), 0);
             let d2 = textureLoad(shadow_map, clamp(b + vec2<i32>(0, 1), vec2<i32>(0), hi), 0);
             let d3 = textureLoad(shadow_map, clamp(b + vec2<i32>(1, 1), vec2<i32>(0), hi), 0);
-            let c0 = clamp((d0 - sp.z) / ramp + 0.5, 0.0, 1.0);
-            let c1 = clamp((d1 - sp.z) / ramp + 0.5, 0.0, 1.0);
-            let c2 = clamp((d2 - sp.z) / ramp + 0.5, 0.0, 1.0);
-            let c3 = clamp((d3 - sp.z) / ramp + 0.5, 0.0, 1.0);
-            let s = mix(mix(c0, c1, f.x), mix(c2, c3, f.x), f.y);
+            let c0 = clamp((d0 - spz) * inv_ramp + 0.5, 0.0, 1.0);
+            let c1 = clamp((d1 - spz) * inv_ramp + 0.5, 0.0, 1.0);
+            let c2 = clamp((d2 - spz) * inv_ramp + 0.5, 0.0, 1.0);
+            let c3 = clamp((d3 - spz) * inv_ramp + 0.5, 0.0, 1.0);
+            let s2 = mix(mix(c0, c1, f.x), mix(c2, c3, f.x), f.y);
             // Past the map's edge there is no verdict; fade toward wrong-dark, the
             // same honesty law as the ground-fog verdict in composite.wgsl (never
             // sun through mountains). The near-duplicate is forced: shared files
             // compile into every stage, and the sky, vertex, weather and tonemap
             // preludes carry no shadow bindings.
-            let d = max(abs(p.x), abs(p.z));
+            let d = t * daxis;           // == max(abs(p.x), abs(p.z)) for t >= 0
             let past = smoothstep(1.0, 1.35, d / max(frame.shadow_distance, 1.0));
             // Past the map's square the verdict is unknown. The old 0.30 floor
             // leaked there: steps beyond the square kept a third of the fan, so
@@ -183,7 +214,7 @@ fn post(input: PostInput) -> vec4<f32> {
             // fully cover the light. Surfaces fade to true shadow; the sky keeps
             // the 0.30 aerial floor because there is no occluder to be honest
             // about, and the fade still never draws an edge.
-            lit_sum += mix(s, select(0.30, 0.0, !over_sky), past);
+            lit_sum += mix(s2, select(0.30, 0.0, !over_sky), past);
         }
         beam = lit_sum / 4.0;
     }

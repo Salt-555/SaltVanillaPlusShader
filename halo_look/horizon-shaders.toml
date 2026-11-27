@@ -1,7 +1,7 @@
 schema = 1
 id = "halo_look"
 name = "Halo Look"
-version = "0.16.40"
+version = "0.16.44"
 api = "0.2"
 description = "Sun shadows from a shadow map, LabPBR surfaces, spectral water with absorption and foam, coloured block light, wind on leaves and plants, sun and moon shafts, aurora and lightning, ground fog, bloom, film grain, and an ACES filmic curve. Heavy sampling at half and quarter resolution. No ray tracing."
 authors = ["Artemis"]
@@ -19,6 +19,7 @@ name = "Wind"
 [material]
 file = "material.wgsl"
 name = "Surface light"
+reads = ["wave_clock"]
 
 [shadow]
 resolution = 1024
@@ -95,11 +96,47 @@ format = "rgba16float"
 scale = 0.25
 keep = "view"
 
+[[resource]]
+name = "wave_clock"
+buffer = 116
+element = "f32"
+keep = "view"
+
+# One dispatch a frame folds the spectrum's frame-constant sines and time products
+# (22 transcendentals per water pixel at the fragment's expense) into a storage buffer
+# that [material] reads; see pre/wave_clock.wgsl for the slot layout.
+[[before_world]]
+file = "pre/wave_clock.wgsl"
+dispatch = [1, 1, 1]
+workgroup = [1, 1, 1]
+writes = ["wave_clock"]
+
 [[post]]
 file = "post/shade.wgsl"
 name = "Shade (half res)"
 output = "shade_buf"
 scale = 0.5
+
+# The shaft pair runs AHEAD of the bloom trio on purpose (0.16.42): the blur's
+# vertical leg folds rays_hist into glow_blur at quarter res, so composite
+# samples one merged additive field instead of two. Reordering these passes
+# without moving the fold would read a stale (previous-frame) rays_hist.
+[[post]]
+file = "post/god_rays.wgsl"
+name = "Sun shafts"
+output = "god_halo"
+scale = 0.25
+
+# No `scale` on this entry by engine contract, not by oversight: an `output`
+# naming a kept texture writes at that texture's own size (rays_hist declares
+# scale 0.25 above) and the manifest refuses the pass if scale appears. The
+# input.pixel <-> god_halo/rays_hist texel alignment in the file rests on the
+# resource's scale, which is the only place it can be declared.
+[[post]]
+file = "post/rays_accum.wgsl"
+name = "Shaft history"
+output = "rays_hist"
+reads = ["rays_hist_previous"]
 
 [[post]]
 file = "post/bloom_bright.wgsl"
@@ -117,24 +154,12 @@ scale = 0.25
 file = "post/bloom_blur_v.wgsl"
 name = "Bloom blur V"
 output = "glow_blur"
+reads = ["rays_hist"]
 scale = 0.25
-
-[[post]]
-file = "post/god_rays.wgsl"
-name = "Sun shafts"
-output = "god_halo"
-scale = 0.25
-
-[[post]]
-file = "post/rays_accum.wgsl"
-name = "Shaft history"
-output = "rays_hist"
-reads = ["rays_hist_previous"]
 
 [[post]]
 file = "post/composite.wgsl"
 name = "Composite and grade"
-reads = ["rays_hist"]
 
 [[options]]
 id = "shadows"

@@ -1,4 +1,4 @@
-# Halo Look 0.16.40
+# Halo Look 0.16.44
 
 A Horizon shader pack (shader API 0.2, WGSL) for the Strix Halo APU. No ray tracing: the
 shadow is a shadow map, the water mirror is a planar reflection, everything else is
@@ -11,19 +11,21 @@ screen-space or analytic. Written against `docs/shaders.md` and
 |---|---|---|
 | `[sky]` | `sky.wgsl` | vanilla's sky plus horizon scatter at a low sun, a deeper zenith, greyer in rain, stars and aurora at night |
 | `[vertex]` | `vertex.wgsl` | wind: sways the leaf, plant and vine sprite classes the manifest maps in `[[materials]]` |
-| `[material]` | `material.wgsl` | LabPBR normals and specular, coloured block light, and water: a traveling dispersive swell with breathing modulation, scrolled ripple maps, the vanilla flow-boil overlay close in, depth absorption, foam, planar mirror, distance-scaled glitter |
+| `[material]` | `material.wgsl` | LabPBR normals and specular, coloured block light, and water: a traveling dispersive swell with breathing modulation (hand-unrolled, frame-constant terms read from the wave clock), scrolled ripple maps, the vanilla flow-boil overlay close in, depth absorption, foam, planar mirror, distance-scaled glitter |
 | `[shadow]` | manifest | 1024 map over 64 blocks, player-selectable resolution and distance |
 | `[reflection]` | manifest | quarter-res planar water mirror: the planar draw is a full second world pass, the pack's one big bill at native 4K |
+| `[[before_world]]` | `pre/wave_clock.wgsl` | one dispatch a frame: folds the spectrum's frame-constant sines and time products (22 transcendentals per water pixel) into the `wave_clock` buffer the material stage reads |
 | `[[post]]` | `post/shade.wgsl` | half-res sun/moon shadow with a distance fade, tint through water and glass, 6-tap contact shading |
+| `[[post]]` | `post/god_rays.wgsl` | quarter-res volumetric march: four jittered shadow-map samples per ray; sun by day, moon (the night caster) by night |
+| `[[post]]` | `post/rays_accum.wgsl` | shaft history: reprojects last frame's cell by the engine's camera-motion law, neighbourhood-clamps it, blends ~thirteen frames of four-step samples; runs ahead of the bloom trio so the blur's vertical leg can fold its output |
 | `[[post]]` | `post/bloom_bright.wgsl` | quarter-res bright pass, soft knee at white |
 | `[[post]]` | `post/bloom_blur.wgsl` | quarter-res 7-tap horizontal blur |
-| `[[post]]` | `post/bloom_blur_v.wgsl` | the vertical leg, pair-split so each reads one cache-resident strip |
-| `[[post]]` | `post/god_rays.wgsl` | quarter-res volumetric march: four jittered shadow-map samples per ray; sun by day, moon (the night caster) by night |
-| `[[post]]` | `post/rays_accum.wgsl` | shaft history: reprojects last frame's cell by the engine's camera-motion law, neighbourhood-clamps it, blends ~thirteen frames of four-step samples |
+| `[[post]]` | `post/bloom_blur_v.wgsl` | the vertical leg, pair-split so each reads one cache-resident strip; folds rays_hist in per texel so composite pays ONE sample for bloom plus shafts |
 | `[[resource]]` | `rays_hist` | the kept history itself: quarter-res rgba16float, held across frames within a view |
-| `[[post]]` | `post/composite.wgsl` | shade and bloom composite, shafts add, ground fog with a shadow verdict, time-of-day grade, vignette, edge-directed smoothing by `textureLoad` |
+| `[[resource]]` | `wave_clock` | the frame-constant wave terms: 29 f32 slots, written by the before-world dispatch, read by `[material] reads` |
+| `[[post]]` | `post/composite.wgsl` | shade and the merged bloom+shaft field (one full-res sample), ground fog with a shadow verdict, time-of-day grade, vignette, edge-directed smoothing by `textureLoad` |
 | `[[tonemap]]` | `tonemap.wgsl` | the ACES filmic fit, last |
-| shared | `common.wgsl` | luma, Fresnel, specular, normal mapping, world reconstruction, sky gradient, integer value noise, the wave field |
+| shared | `common.wgsl` | luma, Fresnel, specular, normal mapping, world reconstruction, sky gradient, integer value noise, the spectrum tables, the shaft lobe constants |
 | `[[textures]]` | `textures/ripple_a.png`, `ripple_b.png` | tileable capillary normal maps (generated band-limited, seamless by construction) |
 
 ## Water
@@ -54,7 +56,10 @@ water pixel at up to the slider's value (60% at the default) inside ten blocks, 
 keeps a 32-pixel feature out of the shimmer band — and its weight rides divided by the
 surface alpha, so the cap means that fraction on screen even on thin cascade sheets. The
 detail slope drives the normal, the mirror, and — the cue that makes near water read wet —
-the refraction of the bed.
+the refraction of the bed; below a 0.55% tilt the ripple layer ramps to zero and its two un-mipped fetches, patch-mix noise and
+rotations are skipped whole. Every frame-constant term of the spectrum (life envelope, travel angle, breathing sway, ripple
+drift) arrives precomputed from the `[[before_world]]` wave clock — one dispatch a frame instead of twenty-two transcendentals
+per water pixel.
 
 And the water asks the sun: glitter, sparkle, crest transmission and the foam's
 white ride one shadow-map compare — the composite pass's own surface law (clamped
@@ -147,7 +152,7 @@ square is drawn again each frame).
 ## Build, check, install
 
     horizon-shader check .
-    horizon-shader pack .          # writes halo_look-0.16.40.hshader
+    horizon-shader pack .          # writes halo_look-0.16.44.hshader
 
 Copy the folder or the `.hshader` into `shaderpacks/` beside `options.txt`.
 `HORIZON_SHADER_PACK=halo_look` forces it for development. A saved pack is re-checked twice a

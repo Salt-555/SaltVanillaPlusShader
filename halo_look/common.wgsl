@@ -5,6 +5,22 @@ fn luma(c: vec3<f32>) -> f32 {
     return dot(c, frame.luminance);
 }
 
+
+// The shaft passes' forward-scatter constant, folded: k, its Schlick floor
+// ((1-k)/(1+k))^3 and the renormalization 1/(1-floor_) as literals, shared by
+// post/god_rays.wgsl and post/rays_accum.wgsl so the history's mirror of the
+// march's bail can never drift. glow = w^3 * LOBE_C1 - LOBE_C0 for
+// w = (1-k)/max(1-k*mu, 0.02); the floor subtraction that closes the lobe clean
+// at mu = -1 is documented at its first use in the march.
+const LOBE_K: f32 = 0.68;
+const LOBE_C1: f32 = 1.0069587230682373;
+const LOBE_C0: f32 = 0.00695878965780139;
+
+// The shaft history's blend weight: pow(0.78, dt*60) == exp2(dt * KEEP_K), the
+// dt-normalized 22%-fresh-per-60fps-frame keep (same time constant at any frame
+// rate); the constant is 60*log2(0.78) in f32.
+const KEEP_K: f32 = -21.507238388061523;
+
 // Schlick's Fresnel, the share of light a surface mirrors at a grazing angle.
 fn fresnel_schlick(cos_t: f32, f0: f32) -> f32 {
     let m = clamp(1.0 - cos_t, 0.0, 1.0);
@@ -24,7 +40,12 @@ fn shine(n: vec3<f32>, l: vec3<f32>, v: vec3<f32>, smoothness: f32) -> f32 {
 fn mapped_normal(n: vec3<f32>, tangent: vec4<f32>, nm: vec4<f32>) -> vec3<f32> {
     let t = normalize(tangent.xyz);
     let b = cross(n, t) * tangent.w;
-    let tn = vec3<f32>(nm.x * 2.0 - 1.0, nm.y * 2.0 - 1.0, max(nm.z, 0.05));
+    // LabPBR: rg carry the normal (green along `b`, down the texture, matching
+    // the engine's tangent frame); blue is ambient occlusion and alpha is the
+    // height, so z is RECONSTRUCTED, never read off blue. Reading blue as z
+    // tilted occluded texels' normals toward the tangent plane.
+    let xy = nm.xy * 2.0 - 1.0;
+    let tn = vec3<f32>(xy.x, xy.y, max(sqrt(max(1.0 - dot(xy, xy), 0.0)), 0.05));
     return normalize(t * tn.x + b * tn.y + n * tn.z);
 }
 
@@ -46,11 +67,13 @@ fn sky_gradient(r: vec3<f32>) -> vec3<f32> {
 // its argument reaches a few thousand radians, which at a few hundred blocks out re-rolls
 // the pattern on every camera move. u32 multiply wraps by definition in WGSL, and a negative
 // i32 cast to u32 is two's complement, so the lattice is deterministic in every direction.
-fn hash2(i: vec2<i32>) -> f32 {
-    var n = u32(i.x) * 374761393u + u32(i.y) * 668265263u;
-    n = (n ^ (n >> 13u)) * 1274126177u;
-    n = n ^ (n >> 16u);
-    return f32(n) * (1.0 / 4294967295.0);
+// One seed multiply-pair is shared by the four lattice corners: in this wrapping ring the
+// x+1 and y+1 corners' seeds are the base plus the two constants, which is exact, and the
+// pack's hottest shared helper stops paying four multiply-pairs for one (0.16.42).
+fn hash2_tail(n: u32) -> f32 {
+    var h = (n ^ (n >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h) * (1.0 / 4294967295.0);
 }
 
 // Smooth aperiodic noise, 0..1. Four hashes and a smoothstep interpolation, no trig.
@@ -58,26 +81,24 @@ fn vnoise(p: vec2<f32>) -> f32 {
     let i = vec2<i32>(floor(p));
     let f = p - vec2<f32>(i);
     let u = f * f * (3.0 - 2.0 * f);
-    let a = hash2(i);
-    let b = hash2(i + vec2<i32>(1, 0));
-    let c = hash2(i + vec2<i32>(0, 1));
-    let d = hash2(i + vec2<i32>(1, 1));
+    let n = u32(i.x) * 374761393u + u32(i.y) * 668265263u;
+    let a = hash2_tail(n);
+    let b = hash2_tail(n + 374761393u);
+    let c = hash2_tail(n + 668265263u);
+    let d = hash2_tail(n + 1043026656u);   // 374761393 + 668265263
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// Constant amplitude-over-wavelength. GPU Gems keeps A/L fixed because "the surface
-// orientation is dominated by waves with greater ratios of amplitude to wavelength", so
-// every train contributes equally to the normal instead of one frequency rowing the surface.
-// We pass the slope amplitude (A*k) directly, which is that ratio times 2*pi.
-const SLOPE_AMP: f32 = 0.022;
-
-// Returns vec4(slope.x, slope.y, 0, height proxy).
 // The spectrum's seven sample points, folded to module tables. var<private>,
 // NOT const: the API doc's warning is explicit — a runtime-indexed read of a
 // module-level const array re-stores the whole array to a temporary on every
-// loop turn on Vulkan, and this loop indexes ten tables seven times a fragment
-// per water pixel. Every module array in the pack is one of these now; the
-// module consts that remain are scalars, which cannot spill.
+// loop turn on Vulkan. The sea's consumer (material.wgsl's wave_field) reads
+// these tables by literal index, hand-unrolled, so the spill never fires; every
+// module array in the pack is one of these, and the module consts that remain
+// are scalars, which cannot spill.
+// WF_OMEGA, WF_PULSE, WF_SWAYP, WF_LIFER and WF_LIFEP are read only by the
+// pre/wave_clock.wgsl pass — they parameterize the frame-constant folds (travel
+// angle, life envelope, breathing sway) it hands the fragment stage raw.
 // Values are identical; only the storage class moves. The fine end of the
 // spectrum is NOT here by design: it is the two tileable ripple normal maps in
 // material.wgsl's detail layer, which buy finer structure for two filtered fetches
@@ -137,44 +158,6 @@ fn wind_heading(q0: vec2<f32>, t: f32) -> f32 {
     // 0.523+pi, not 0.523: field checks at 4K showed the plain east-southeast run
     // reads backwards off the shore. Settled decision — do not re-flip it.
     return 0.523 + 3.14159 + 1.1 * (vnoise(q0 * 0.0043 + vec2<f32>(t * 0.0062, -t * 0.0041)) - 0.5);
-}
-
-// The sea's shape: a sampled directional spectrum, seven trains of it. q is the
-// domain-warped world xz; ch/sh are cos/sin of the live wind heading, applied to the
-// whole fan at once (GPU Gems: turning the spectrum is fine, stretching one live
-// wave is not). Returns vec4(slope.x, slope.y, 0, height proxy). The sea is not a
-// list of trains; it is a continuous spectrum — energy heaped around one wind
-// heading and falling off in bearing and wavenumber together, with components being
-// born and dying independently. This loop samples seven points of that shape; the
-// fine end of the spectrum is the ripple textures in the material stage. Nothing
-// here is a round number the eye can find a period in: a hand-placed list at
-// evenly-spaced bearings and wavelengths is a lattice generator, and the eye finds
-// the lattice.
-// Shore coupling: adding the water's depth to the long trains' phase slides
-// their crests along the depth contours (equal depth = equal phase), which is the
-// cheap form of wave refraction: real swell turns to run parallel to the shore and
-// shortens as it shallows, and a gradient of phase per gradient of depth produces
-// exactly that, free.
-fn wave_field(q: vec2<f32>, t: f32, shore_phase: f32, ch: f32, sh: f32) -> vec4<f32> {
-    let u = q.x * ch + q.y * sh;
-    let v = q.y * ch - q.x * sh;
-    // Aperiodic patches of calm and rough.
-    let group = 0.70 + 0.30 * vnoise(q * 0.022 + vec2<f32>(t * 0.010, -t * 0.008));
-    var acc = vec3<f32>(0.0);
-    for (var i: u32 = 0u; i < 7u; i = i + 1u) {
-        let env = 0.65 + 0.35 * sin(t * WF_LIFER[i] + WF_LIFEP[i]);
-        let phase = WF_K[i] * (u * WF_CC[i] + v * WF_CS[i])
-                  - t * WF_OMEGA[i]
-                  - WF_SWAYP[i] * sin(t * WF_PULSE[i] + WF_LIFEP[i]) + WF_SHORE[i] * shore_phase;
-        let sn = sin(phase);
-        let cs = cos(phase);
-        let s = -(sn + WF_STEEP[i] * 2.0 * sn * cs) * SLOPE_AMP * env;
-        // The bearing back in world parts: the inverse rotation of the fixed angle.
-        acc += vec3<f32>((ch * WF_CC[i] - sh * WF_CS[i]) * s,
-                         (sh * WF_CC[i] + ch * WF_CS[i]) * s,
-                         sn * (SLOPE_AMP / WF_K[i]) * env);
-    }
-    return vec4<f32>(acc.x, acc.y, 0.0, acc.z) * group;
 }
 
 // Integer hashes for the sky and for things that re-roll in time. They never seed a

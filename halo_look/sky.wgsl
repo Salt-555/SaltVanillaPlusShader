@@ -11,18 +11,34 @@ fn sky(input: SkyInput) -> vec4<f32> {
     // aurora, the moon halo and lightning too, which each have their own
     // slider — and it silenced the rain grey-out further down, which is
     // frame.rain's to own, not the haze slider's, at every haze value.
-    let d = normalize(input.direction);
+    let d = input.direction;   // the engine hands this unit (docs 0.2 "Unit view ray";
+                               // both engine sky entries normalize before calling), so a
+                               // second per-pixel normalize only divided by 1±ulp (0.16.42).
     let sun = frame.sun_direction;
     let low = 1.0 - clamp(abs(sun.y) * 2.2, 0.0, 1.0);
-    let horizon = pow(1.0 - clamp(abs(d.y), 0.0, 1.0), 3.0);
-    let toward = pow(max(dot(d, sun), 0.0), 4.0);
     let warm = vec3<f32>(1.0, 0.52, 0.26);
     var c = input.color.rgb;
-    c = mix(c, c * warm + warm * 0.05, horizon * low * 0.55 * sky_haze);
-    c += warm * toward * low * 0.22 * sky_haze;
-    // A tight inner halo on the sun's own disc (Mie's forward lobe, as a high exponent).
-    c += warm * pow(max(dot(d, sun), 0.0), 24.0) * low * 0.06 * sky_haze;
-    c += vec3<f32>(0.9, 0.95, 1.0) * pow(max(dot(d, sun), 0.0), 60.0) * (1.0 - low) * 0.05 * sky_haze;
+    // Integer-exponent pows are guarded powf call sequences where naga stops; these
+    // chains are what they evaluated to, as plain multiplies (0.16.42). The 60-power
+    // serves every pixel (it is at FULL strength when low == 0), hence lives outside
+    // the gate below.
+    let dsun = max(dot(d, sun), 0.0);
+    let ds2 = dsun * dsun;
+    let ds4 = ds2 * ds2;
+    let ds8 = ds4 * ds4;
+    let ds16 = ds8 * ds8;
+    let ds32 = ds16 * ds16;
+    // The whole warm-scatter chain multiplies by low, which is EXACTLY 0.0 at every
+    // midday hour and all of deep night — gated, not multiplied, since nothing below
+    // the gate feeds anything else (0.16.42).
+    if low > 0.0 {
+        let hb = 1.0 - clamp(abs(d.y), 0.0, 1.0);
+        c = mix(c, c * warm + warm * 0.05, hb * hb * hb * low * 0.55 * sky_haze);
+        c += warm * ds4 * low * 0.22 * sky_haze;
+        // A tight inner halo on the sun's own disc (Mie's forward lobe, as a high exponent).
+        c += warm * (ds16 * ds8) * low * 0.06 * sky_haze;
+    }
+    c += vec3<f32>(0.9, 0.95, 1.0) * (ds32 * ds16 * ds8 * ds4) * (1.0 - low) * 0.05 * sky_haze;
     let zenith = pow(clamp(d.y, 0.0, 1.0), 0.6);
     c = mix(c, c * vec3<f32>(0.86, 0.93, 1.06), zenith * 0.35 * sky_haze);
     c = mix(c, vec3<f32>(luma(c)) * vec3<f32>(0.95, 0.97, 1.0), frame.rain * 0.45);
@@ -49,10 +65,15 @@ fn sky(input: SkyInput) -> vec4<f32> {
             // The Milky Way: one dust band along a fixed tilted axis. Its stars are too
             // dense to resolve individually, so it is noise, not points. The dust samples
             // direction components, not atan2 — an azimuth key seams where the angle wraps.
-            let band = pow(1.0 - clamp(abs(dot(d, normalize(vec3<f32>(0.42, 0.55, -0.66)))), 0.0, 1.0), 3.0);
-            let dust = 0.5 * (vnoise(vec2<f32>(d.x * 6.0, d.y * 7.0))
-                            + vnoise(vec2<f32>(d.z * 6.0, d.y * 7.0 + 3.0)));
-            c += vec3<f32>(0.52, 0.58, 0.85) * band * (0.3 + 0.7 * dust) * clear * stars * 0.06;
+            let hb = 1.0 - clamp(abs(dot(d, normalize(vec3<f32>(0.42, 0.55, -0.66)))), 0.0, 1.0);
+            let band = hb * hb * hb;
+            // Two caps around the band's poles (|dot| > 0.785) bound the whole dust
+            // term under one 8-bit display step, so both noises skip there (0.16.42).
+            if band > 0.01 {
+                let dust = 0.5 * (vnoise(vec2<f32>(d.x * 6.0, d.y * 7.0))
+                                + vnoise(vec2<f32>(d.z * 6.0, d.y * 7.0 + 3.0)));
+                c += vec3<f32>(0.52, 0.58, 0.85) * band * (0.3 + 0.7 * dust) * clear * stars * 0.06;
+            }
         }
         if aurora > 0.0 {
             // One curtain hung along the x meridian (azimuth 0) — deliberately off the
@@ -63,15 +84,20 @@ fn sky(input: SkyInput) -> vec4<f32> {
             // gently across the noise — wisps, not patches. Green at its feet, violet
             // in its rises. (Squared term on purpose: pow() with a possibly-negative
             // base is undefined in WGSL - multiply it out.)
-            let az = atan2(d.z, d.x);
-            let dz = az / 1.1;
-            let wide = exp(-dz * dz);
             let height = smoothstep(0.015, 0.14, d.y) * smoothstep(0.72, 0.26, d.y);
-            let fold = 0.5 * (vnoise(vec2<f32>(az * 7.0 + frame.time * 0.040, d.y * 3.2 - frame.time * 0.012))
-                            + vnoise(vec2<f32>(az * 2.3 - frame.time * 0.017, d.y * 6.4)));
-            let glow = wide * height * smoothstep(0.30, 0.92, fold) * clear * aurora;
-            c += mix(vec3<f32>(0.16, 1.0, 0.42), vec3<f32>(0.58, 0.32, 1.0),
-                     clamp((d.y - 0.10) / 0.38, 0.0, 1.0)) * glow * 0.4;
+            // Outside the height window (~2/3 of the sphere, screen-coherent bands)
+            // the curtain adds exactly +0.0: the atan2, the Gaussian and both noise
+            // folds gate on it (0.16.42).
+            if height > 0.0 {
+                let az = atan2(d.z, d.x);
+                let dz = az / 1.1;
+                let wide = exp(-dz * dz);
+                let fold = 0.5 * (vnoise(vec2<f32>(az * 7.0 + frame.time * 0.040, d.y * 3.2 - frame.time * 0.012))
+                                + vnoise(vec2<f32>(az * 2.3 - frame.time * 0.017, d.y * 6.4)));
+                let glow = wide * height * smoothstep(0.30, 0.92, fold) * clear * aurora;
+                c += mix(vec3<f32>(0.16, 1.0, 0.42), vec3<f32>(0.58, 0.32, 1.0),
+                         clamp((d.y - 0.10) / 0.38, 0.0, 1.0)) * glow * 0.4;
+            }
         }
         if moon_halo > 0.0 {
             // The moon's own coronet: a tight glass-disc gleam plus a wide soft lobe,
@@ -85,14 +111,29 @@ fn sky(input: SkyInput) -> vec4<f32> {
             // a slice of the angle range — same peak, same total, no single band
             // owning the falloff (one dominant band carves a visible rim at its
             // half-angle), and the dome closes smoothly toward the horizon.
-            c += vec3<f32>(0.72, 0.80, 1.0)
-               * (pow(md, 140.0) * 0.30 + pow(md, 30.0) * 0.020
-                  + pow(md, 12.0) * 0.028 + pow(md, 5.0) * 0.024
-                  + pow(md, 2.0) * 0.014) * clear * moon_halo;
-            let e = d.y / 0.055;
-            let band = exp(-e * e) * (0.55 + 0.45 * vnoise(d.xz * 2.5
-                                    + vec2<f32>(0.0, frame.time * 0.004)));
-            c += vec3<f32>(0.42, 0.72, 0.58) * band * 0.030 * clear * moon_halo;
+            // Half the sphere faces away from the moon, where md is exactly 0.0 and
+            // the cascade adds +0.0 — gated; and the five lobes share one log2 for
+            // their two wide powers, three of them plain multiply chains (0.16.42).
+            // The five lobes themselves are the settled rim-free design, untouched.
+            if md > 0.0 {
+                let m2 = md * md;
+                let m4 = m2 * m2;
+                let m12 = m4 * m4 * m4;
+                let lm = log2(md);
+                c += vec3<f32>(0.72, 0.80, 1.0)
+                   * (exp2(lm * 140.0) * 0.30 + exp2(lm * 30.0) * 0.020
+                      + m12 * 0.028 + (m4 * md) * 0.024
+                      + m2 * 0.014) * clear * moon_halo;
+            }
+            // Airglow: |d.y| >= 0.16 puts the Gaussian near e^-8.5, so the whole
+            // term sits ~300x under one display step there and the vnoise is
+            // invisible (0.16.42).
+            if abs(d.y) < 0.16 {
+                let e = d.y / 0.055;
+                let ag = exp(-e * e) * (0.55 + 0.45 * vnoise(d.xz * 2.5
+                                        + vec2<f32>(0.0, frame.time * 0.004)));
+                c += vec3<f32>(0.42, 0.72, 0.58) * ag * 0.030 * clear * moon_halo;
+            }
         }
     }
     if frame.rain > 0.01 && storm > 0.0 {

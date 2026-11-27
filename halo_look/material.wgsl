@@ -21,6 +21,102 @@ override shadows: bool = true;
 override shadow_softness: f32 = 0.0;
 override ore_glow: f32 = 0.5;
 
+
+// Constant amplitude-over-wavelength. GPU Gems keeps A/L fixed because "the surface
+// orientation is dominated by waves with greater ratios of amplitude to wavelength", so
+// every train contributes equally to the normal instead of one frequency rowing the surface.
+// The height term per train rides SLOPE_AMP / WF_K[i] pre-divided: the literals in
+// wave_field are the exact f32 quotients, so the per-train runtime divide is gone
+// without a rounding moving.
+const SLOPE_AMP: f32 = 0.022;
+
+// The ripple layers' two fixed bearings off the live heading, as exact f32 angle constants
+// for the addition formulas in the water branch (cos(h+0.35), sin(h+0.35), cos(h-0.55),
+// sin(h-0.55)) — four quarter-rate transcendentals per pixel bought down to eight mults.
+const COS35: f32 = 0.939372718334198;
+const SIN35: f32 = 0.34289780259132385;
+const COS55: f32 = 0.8525245189666748;
+const SIN55: f32 = 0.5226872563362122;
+
+// The sea's shape: a sampled directional spectrum, seven trains of it (the tables and the
+// spectrum's contract live in common.wgsl). Local to the water branch, which is its only
+// caller, and HAND-UNROLLED on purpose: every table read takes a literal index, which folds
+// the private-array reads to immediates (docs/api/shaders-reference-0.2.md, Tables: a
+// constant index avoids the spill store) while the accumulation keeps the loop's exact
+// train order, so every sum is the same sequence of adds. The frame-constant terms — the
+// life envelope, the travel angle, the breathing sway — arrive precomputed from the
+// [[before_world]] wave clock: env = wave_clock[i], travel = wave_clock[7u+i], sway =
+// wave_clock[14u+i] (see pre/wave_clock.wgsl for the layout and the exact arithmetic).
+// q is the domain-warped world xz; ch/sh are cos/sin of the live wind heading, applied to
+// the whole fan at once. Returns vec4(slope.x, slope.y, 0, height proxy).
+// Shore coupling: adding the water's depth to the long trains' phase slides their crests
+// along the depth contours (equal depth = equal phase) — the cheap form of wave refraction:
+// real swell turns to run parallel to the shore and shortens as it shallows.
+fn wave_field(q: vec2<f32>, shore_phase: f32, ch: f32, sh: f32) -> vec4<f32> {
+    let u = q.x * ch + q.y * sh;
+    let v = q.y * ch - q.x * sh;
+    // Aperiodic patches of calm and rough.
+    let group = 0.70 + 0.30 * vnoise(q * 0.022 + vec2<f32>(frame.time * 0.010, -frame.time * 0.008));
+    var acc = vec3<f32>(0.0);
+    let ph0 = WF_K[0u] * (u * WF_CC[0u] + v * WF_CS[0u]) - wave_clock[7u + 0u] - wave_clock[14u + 0u] + WF_SHORE[0u] * shore_phase;
+    let sn0 = sin(ph0);
+    let cs0 = cos(ph0);
+    let en0 = wave_clock[0u];
+    let sl0 = -(sn0 + WF_STEEP[0u] * 2.0 * sn0 * cs0) * SLOPE_AMP * en0;
+    acc += vec3<f32>((ch * WF_CC[0u] - sh * WF_CS[0u]) * sl0,
+                     (sh * WF_CC[0u] + ch * WF_CS[0u]) * sl0,
+                     sn0 * 0.09053497761487961 * en0);
+    let ph1 = WF_K[1u] * (u * WF_CC[1u] + v * WF_CS[1u]) - wave_clock[7u + 1u] - wave_clock[14u + 1u] + WF_SHORE[1u] * shore_phase;
+    let sn1 = sin(ph1);
+    let cs1 = cos(ph1);
+    let en1 = wave_clock[1u];
+    let sl1 = -(sn1 + WF_STEEP[1u] * 2.0 * sn1 * cs1) * SLOPE_AMP * en1;
+    acc += vec3<f32>((ch * WF_CC[1u] - sh * WF_CS[1u]) * sl1,
+                     (sh * WF_CC[1u] + ch * WF_CS[1u]) * sl1,
+                     sn1 * 0.06874334067106247 * en1);
+    let ph2 = WF_K[2u] * (u * WF_CC[2u] + v * WF_CS[2u]) - wave_clock[7u + 2u] - wave_clock[14u + 2u] + WF_SHORE[2u] * shore_phase;
+    let sn2 = sin(ph2);
+    let cs2 = cos(ph2);
+    let en2 = wave_clock[2u];
+    let sl2 = -(sn2 + WF_STEEP[2u] * 2.0 * sn2 * cs2) * SLOPE_AMP * en2;
+    acc += vec3<f32>((ch * WF_CC[2u] - sh * WF_CS[2u]) * sl2,
+                     (sh * WF_CC[2u] + ch * WF_CS[2u]) * sl2,
+                     sn2 * 0.052196916192770004 * en2);
+    let ph3 = WF_K[3u] * (u * WF_CC[3u] + v * WF_CS[3u]) - wave_clock[7u + 3u] - wave_clock[14u + 3u] + WF_SHORE[3u] * shore_phase;
+    let sn3 = sin(ph3);
+    let cs3 = cos(ph3);
+    let en3 = wave_clock[3u];
+    let sl3 = -(sn3 + WF_STEEP[3u] * 2.0 * sn3 * cs3) * SLOPE_AMP * en3;
+    acc += vec3<f32>((ch * WF_CC[3u] - sh * WF_CS[3u]) * sl3,
+                     (sh * WF_CC[3u] + ch * WF_CS[3u]) * sl3,
+                     sn3 * 0.03963319584727287 * en3);
+    let ph4 = WF_K[4u] * (u * WF_CC[4u] + v * WF_CS[4u]) - wave_clock[7u + 4u] - wave_clock[14u + 4u] + WF_SHORE[4u] * shore_phase;
+    let sn4 = sin(ph4);
+    let cs4 = cos(ph4);
+    let en4 = wave_clock[4u];
+    let sl4 = -(sn4 + WF_STEEP[4u] * 2.0 * sn4 * cs4) * SLOPE_AMP * en4;
+    acc += vec3<f32>((ch * WF_CC[4u] - sh * WF_CS[4u]) * sl4,
+                     (sh * WF_CC[4u] + ch * WF_CS[4u]) * sl4,
+                     sn4 * 0.030093543231487274 * en4);
+    let ph5 = WF_K[5u] * (u * WF_CC[5u] + v * WF_CS[5u]) - wave_clock[7u + 5u] - wave_clock[14u + 5u] + WF_SHORE[5u] * shore_phase;
+    let sn5 = sin(ph5);
+    let cs5 = cos(ph5);
+    let en5 = wave_clock[5u];
+    let sl5 = -(sn5 + WF_STEEP[5u] * 2.0 * sn5 * cs5) * SLOPE_AMP * en5;
+    acc += vec3<f32>((ch * WF_CC[5u] - sh * WF_CS[5u]) * sl5,
+                     (sh * WF_CC[5u] + ch * WF_CS[5u]) * sl5,
+                     sn5 * 0.022850070148706436 * en5);
+    let ph6 = WF_K[6u] * (u * WF_CC[6u] + v * WF_CS[6u]) - wave_clock[7u + 6u] - wave_clock[14u + 6u] + WF_SHORE[6u] * shore_phase;
+    let sn6 = sin(ph6);
+    let cs6 = cos(ph6);
+    let en6 = wave_clock[6u];
+    let sl6 = -(sn6 + WF_STEEP[6u] * 2.0 * sn6 * cs6) * SLOPE_AMP * en6;
+    acc += vec3<f32>((ch * WF_CC[6u] - sh * WF_CS[6u]) * sl6,
+                     (sh * WF_CC[6u] + ch * WF_CS[6u]) * sl6,
+                     sn6 * 0.0173500906676054 * en6);
+    return vec4<f32>(acc.x, acc.y, 0.0, acc.z) * group;
+}
+
 fn material(input: MaterialInput) -> Surface {
     // Fully transparent texels - leaf gaps, the empty corners of cross quads - are invisible
     // in every blend mode and alpha-tested away anyway. Returning before anything else spares
@@ -30,97 +126,15 @@ fn material(input: MaterialInput) -> Surface {
         return Surface(vec4<f32>(0.0));
     }
     let n_geo = normalize(input.normal);
-    let pbr = block_pbr_maps();
-    var n = n_geo;
-    var smoothness = 0.0;
-    var emission_map = 0.0;
-    if pbr {
-        // both reads inside the branch: with no LabPBR pack installed they cost nothing
-        let spec_map = block_specular_map(input.uv);
-        n = mapped_normal(n_geo, input.tangent, block_normal_map(input.uv));
-        smoothness = spec_map.r;
-        emission_map = spec_map.a;
-    }
-
-    // vanilla's lit colour, in linear light
-    let base = input.albedo.rgb * input.shaded_tint.rgb;
-    var color = base * input.lightmap;
-
-    // coloured block light: shift the hue of the block-lit part, keep its brightness
-    // the light grid is a trilinear 3D sample, eight fetches: skip it where no block
-    // light reaches, which is most of a daylit surface. The engine's colour grid is
-    // a 128-block cube around the camera that samples 0 outside, and its edge sits
-    // anywhere from 48 to 64 blocks out, snapping 16 blocks whenever the cube
-    // recentres — so the hue is faded in over the last stretch before 48, the
-    // closest that edge ever gets. Then it fades with distance instead of switching
-    // on at the cube's wall, however the cube moves.
-    let gf = min(min(1.0 - smoothstep(40.0, 48.0, abs(input.position.x)),
-                     1.0 - smoothstep(40.0, 48.0, abs(input.position.y))),
-                 1.0 - smoothstep(40.0, 48.0, abs(input.position.z)));
-    if colored_light > 0.0 && input.light.x > 0.01 && gf > 0.0 {
-        let cl = block_light_color(input.position);
-        // cl.a is the engine's own proximity term: (1 - d/level)^2 summed over
-        // the lights that reach here — continuous in distance. sqrt brings it
-        // back to a linear falloff. The hue rode on input.light.x alone, which
-        // is the light engine's integer level dropping one full 1/15 rung per
-        // block: that is the step. Riding the proximity curve instead lets the
-        // torch's colour fade in while you walk to the flame; light.x stays as
-        // the gate that the surface is block-lit at all.
-        let near = sqrt(min(cl.a, 1.0));
-        let tint = mix(vec3<f32>(1.0), cl.rgb, near * colored_light);
-        color += base * near * gf * (tint - vec3<f32>(1.0));
-    }
-    // the engine's carried block lights — held and dropped items, and any
-    // [[particle_lights]] or mod lights upstream — ride in as a hue shift
-    if any(input.colored_light > vec3<f32>(0.0)) {
-        color = mix(color, color * (vec3<f32>(1.0) + input.colored_light), 0.5);
-    }
-
-    // the sun's or moon's highlight where the sky reaches the surface
     let view = normalize(-input.position);
     let light_dir = frame.light_direction;
-    if specular > 0.0 && light_dir.y > 0.0 {
-        // Specular only where a normal map gives variation inside a face: a block face
-        // has a flat normal, so a highlight is near-constant across it and paints the
-        // whole face pale. Water keeps its glint because the wave field varies the
-        // normal per fragment.
-        // LabPBR smoothness, only where a resource pack actually ships maps
-        if smoothness > 0.02 {
-            let sun_tint = mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.35);
-            let glint = shine(n, light_dir, view, smoothness) * input.light.y * specular;
-            color += vec3<f32>(glint * 0.5) * sun_tint;
-        }
-    }
-
-    // LabPBR's per-texel emission: glowing ore, a lamp's filament
-    if emission_map > 0.0 {
-        color += base * emission_map * 0.5;
-    }
-
-    // Ore glow: the manifest names the fourteen glowing sprites outright
-    // (coal and the nether ores are deliberately outside the list), so this
-    // is a block-class lookup, not a color guess. Gate and add read the raw
-    // texture, not base: base carries the per-face shade and AO, and a
-    // "self"-light that swings 3x with face orientation is the wrong law
-    // (measured at the 0.16.39 review). The add is the texel's own color
-    // times its chroma: saturated flecks brighten toward the bloom knee
-    // (post/bloom_bright.wgsl — diamond, gold and emerald cross it and halo;
-    // the pale sprites glow without one until the slider lifts them over),
-    // the stone or deepslate host gates out, and the hue carries itself with
-    // no per-ore table. Gate floor 0.05 sits a quarter above the warmest
-    // overworld host texel measured (0.0375, deepslate redstone). Where a
-    // LabPBR pack already emits through the block above, this adds only the
-    // excess over that emission: never a stack, and no per-texel handoff on
-    // the smallest step of an 8-bit channel.
-    if ore_glow > 0.0 && input.material == 8u {
-        let lit = input.albedo.rgb;
-        let fleck = smoothstep(0.05, 0.25,
-            max(lit.r, max(lit.g, lit.b)) - min(lit.r, min(lit.g, lit.b)));
-        color += lit * max(ore_glow * fleck - emission_map * 0.5, 0.0);
-    }
-
     var alpha = input.albedo.a;
 
+    // Water first, and the terrain prologue below stays below it: the water branch shares
+    // only n_geo, view, light_dir and the alpha slot with the terrain path, so keeping them
+    // apart means a water pixel never pays the coloured-light grid sample, the LabPBR fetches,
+    // the terrain glint or the ore glow — and new terrain-only work must keep landing AFTER
+    // this branch or it silently joins the water bill.
     if input.translucent && input.fluid == 1u {
         let dist = length(input.position);
         // input.position is camera-relative: anchor the field to the world, or the whole
@@ -143,11 +157,19 @@ fn material(input: MaterialInput) -> Surface {
         let detail = 1.0 / (1.0 + dist * 0.035);
         // One warp and one heading for everything: the swell field AND the ripple
         // textures ride the same wander and the same wind.
-        let q = world.xz + wave_warp(world.xz, frame.time, wave_bend);
+        var q = world.xz;
+        if wave_bend > 0.0 {
+            // A zero slider means zero: the branch deletes the warp's two noise looks;
+            // a multiply by 0 would leave them running.
+            q = q + wave_warp(world.xz, frame.time, wave_bend);
+        }
         let heading = wind_heading(world.xz, frame.time);
         let ch = cos(heading);
         let sh = sin(heading);
-        let field = wave_field(q, frame.time, shore_phase, ch, sh);
+        var field = vec4<f32>(0.0);
+        if water_waves > 0.0 {
+            field = wave_field(q, shore_phase, ch, sh);
+        }
         let slope = field.xy * water_waves * shallow;
         let crest_h = clamp(field.w * 3.0 * water_waves, 0.0, 1.0);
 
@@ -160,37 +182,36 @@ fn material(input: MaterialInput) -> Surface {
         // bend the normal and the reflection, not the foam: foam marks breaking crests,
         // and a crest is a swell event. (Layer B rides back in layer A's rotation frame
         // - a fixed 0.9 rad skew on isotropic chop, which is nothing.)
-        let da = heading + 0.35;
-        let ca = cos(da);
-        let sa = sin(da);
-        // Chop rides the current too. Water does move along with wind-driven waves
-        // (Stokes drift, plus surface drag), and standing chop alone reads as
-        // dead water. Each layer slides slowly along its own bearing — fractions of a
-        // block per second, the swell carries the fast visible flow — while keeping
-        // the orbital sway on top: trackable motion without the single-axis conveyor
-        // that a pure linear scroll makes.
-        let t = frame.time;
-        let oa1 = sin(t * 0.110) * 0.34 + sin(t * 0.043) * 0.18;
-        let oa2 = sin(t * 0.090 + 1.3) * 0.30 + sin(t * 0.031 + 2.4) * 0.16;
-        let ua = (q.x * ca + q.y * sa) * 0.0781 + oa1 + t * 0.030;   // /12.8 blocks
-        let va = (q.y * ca - q.x * sa) * 0.0781 + oa2 + t * 0.008;
-        let na = textureSampleLevel(ripple_a, ripple_a_sampler, vec2<f32>(ua, va), 0.0).xyz * 2.0 - 1.0;
-        let db = heading - 0.55;
-        let cb = cos(db);
-        let sb = sin(db);
-        let ob1 = sin(t * 0.083 + 2.1) * 0.30 + sin(t * 0.037 + 0.7) * 0.15;
-        let ob2 = sin(t * 0.075 + 4.0) * 0.28 + sin(t * 0.029 + 5.1) * 0.14;
-        let ub = (q.x * cb + q.y * sb) * 0.1220 + ob1 + t * 0.022;   // /8.2 blocks
-        let vb = (q.y * cb - q.x * sb) * 0.1220 + ob2 + t * 0.009;
-        let nb = textureSampleLevel(ripple_b, ripple_b_sampler, vec2<f32>(ub, vb), 0.0).xyz * 2.0 - 1.0;
-        let msrc = vnoise(q * 0.05 + vec2<f32>(frame.time * 0.03, -frame.time * 0.02));
-        let nd = mix(na.xy, nb.xy, msrc);
         // detail^3 for distance; and a shore weighting — wind chop is born against the
         // shallows and dies in the deep center, so `path` (the depth under the surface)
         // decides the energy: full in the first blocks, a third of it in open deep water.
         let chop = mix(1.0, 0.30, smoothstep(1.5, 6.5, path));
-        let dfade = detail * detail * detail * 1.15 * chop;
-        let slope_n = slope + vec2<f32>(ca * nd.x - sa * nd.y, sa * nd.x + ca * nd.y) * dfade;
+        let df_raw = detail * detail * detail * 1.15 * chop;
+        // The amplitude gate: below ~0.55% tilt the layer is sub-pixel by construction, so
+        // ramp it to zero across this band and take the two un-mipped fetches, the patch-mix
+        // noise and both rotations out with it. dfade -> 0 is the layer's own continuation at
+        // this bound (never a neutral default), so nothing can re-appear as a ring; near and
+        // mid water are untouched, bit for bit.
+        let dfade = df_raw * (1.0 - smoothstep(0.0030, 0.0055, df_raw));
+        var slope_n = slope;
+        if dfade > 0.0 {
+            // Bearing offsets from the live heading by angle addition: the two layer skews
+            // are constants, so the four extra sin/cos are pure waste. Exact f32 angle
+            // constants below (module scope).
+            let ca = ch * COS35 - sh * SIN35;
+            let sa = sh * COS35 + ch * SIN35;
+            let ua = (q.x * ca + q.y * sa) * 0.0781 + wave_clock[21u] + wave_clock[25u];   // /12.8 blocks
+            let va = (q.y * ca - q.x * sa) * 0.0781 + wave_clock[22u] + wave_clock[26u];
+            let na = textureSampleLevel(ripple_a, ripple_a_sampler, vec2<f32>(ua, va), 0.0).xyz * 2.0 - 1.0;
+            let cb = ch * COS55 + sh * SIN55;
+            let sb = sh * COS55 - ch * SIN55;
+            let ub = (q.x * cb + q.y * sb) * 0.1220 + wave_clock[23u] + wave_clock[27u];   // /8.2 blocks
+            let vb = (q.y * cb - q.x * sb) * 0.1220 + wave_clock[24u] + wave_clock[28u];
+            let nb = textureSampleLevel(ripple_b, ripple_b_sampler, vec2<f32>(ub, vb), 0.0).xyz * 2.0 - 1.0;
+            let msrc = vnoise(q * 0.05 + vec2<f32>(frame.time * 0.03, -frame.time * 0.02));
+            let nd = mix(na.xy, nb.xy, msrc);
+            slope_n = slope + vec2<f32>(ca * nd.x - sa * nd.y, sa * nd.x + ca * nd.y) * dfade;
+        }
         // The boil is vanilla's own, asked of the engine rather than rebuilt.
         // block_texture(input.uv) returns the water block's current animation frame at
         // its own sprite coords: the engine cycles frames at tick rate (vanilla's
@@ -280,7 +301,7 @@ fn material(input: MaterialInput) -> Surface {
                     lit = textureSampleCompareLevel(shadow_map, shadow_sampler,
                                                     uv, sp.z);
                     if shadow_softness > 0.0 {
-                        let r = min((1.0 + length(input.position) * 0.02)
+                        let r = min((1.0 + dist * 0.02)
                                   * shadow_softness, 4.0)
                               / max(frame.shadow_resolution, 1.0);
                         lit += textureSampleCompareLevel(shadow_map, shadow_sampler,
@@ -320,28 +341,32 @@ fn material(input: MaterialInput) -> Surface {
         let lm = input.lightmap;
         let g = luma(lm);
         let lm_w = pow(max(mix(vec3<f32>(g), lm, 0.5), vec3<f32>(0.0)), vec3<f32>(0.9));
-        let ndl = clamp(dot(nw, frame.light_direction) * 0.5 + 0.5, 0.0, 1.0);
+        let ndl = clamp(dot(nw, light_dir) * 0.5 + 0.5, 0.0, 1.0);
         let body = (behind * absorb + vec3<f32>(0.02, 0.09, 0.12) * lm_w * (1.0 - absorb))
                  * (0.92 + 0.08 * ndl);
 
         // foam from crest steepness and shore depth under one slow mask: no product of plane
         // waves (a checkerboard) and no fract(sin(x)*43758) hash, which re-rolls at world scale
         let shore = 1.0 - exp(-path * 3.0);
-        let crest = clamp(length(slope) * 4.0 - 0.45, 0.0, 1.0);
+        let slen = length(slope);
+        let crest = clamp(slen * 4.0 - 0.45, 0.0, 1.0);
+        var foam = 0.0;
+        if water_foam > 0.0 {
         // the swash line breathes: one slow, per-patch phase drives where the foam edge
         // sits and how bright it runs, so the waterline advances up the beach and drains
         // back down it, which is what a breaking wave actually looks like from far away
-        let run = sin(frame.time * 0.75 + vnoise(world.xz * 0.05 + vec2<f32>(7.31, 2.17)) * 6.2831);
-        let swash = 0.5 + 0.5 * run;
-        let foam_edge = 0.30 + 0.16 * run;
-        // aperiodic patches: a single plane wave here would be 32-block parallel bands of foam
-        let mask = smoothstep(0.35, 0.78, vnoise(world.xz * 0.09 + vec2<f32>(frame.time * 0.03, -frame.time * 0.02)));
-        let foam = clamp((1.0 - smoothstep(foam_edge - 0.10, foam_edge + 0.34, path))
+            let run = sin(frame.time * 0.75 + vnoise(world.xz * 0.05 + vec2<f32>(7.31, 2.17)) * 6.2831);
+            let swash = 0.5 + 0.5 * run;
+            let foam_edge = 0.30 + 0.16 * run;
+            // aperiodic patches: a single plane wave here would be 32-block parallel bands of foam
+            let mask = smoothstep(0.35, 0.78, vnoise(world.xz * 0.09 + vec2<f32>(frame.time * 0.03, -frame.time * 0.02)));
+            foam = clamp((1.0 - smoothstep(foam_edge - 0.10, foam_edge + 0.34, path))
                              * (0.55 + 0.45 * swash)
                          + crest * mask * 1.2
                          + crest * (1.0 - smoothstep(0.0, 3.5, path)) * 0.8 * swash,
                          0.0, 1.0)
                  * water_foam;
+        }
         let foamy = mix(body, vec3<f32>(0.9, 0.95, 1.0) * lm_w * sun_diff,
                         foam * 0.65);
 
@@ -355,6 +380,9 @@ fn material(input: MaterialInput) -> Surface {
         // Trust it fully within two blocks of the plane, not at all eight out.
         let on_plane = 1.0 - smoothstep(2.0, 8.0, abs(frame.water_plane - world.y));
         var mirror = sky_gradient(r);
+        // Water composes its own color from the mix below; the terrain prologue's color
+        // never reaches this branch, and this branch never reads it.
+        var color = vec3<f32>(0.0);
         if reflections && frame.has_reflection == 1u {
             let muv = clamp(input.screen + slope_n * (0.030 + dist * 0.0006) * reflection_distort,
                             vec2<f32>(0.002), vec2<f32>(0.998));
@@ -367,32 +395,43 @@ fn material(input: MaterialInput) -> Surface {
         }
         color = mix(foamy, mirror, fres_m);
 
-        // light through the thin water at a crest, the cheap subsurface term Seascape uses
-        color += vec3<f32>(0.05, 0.18, 0.20) * lm_w * crest_h * 0.35 * input.light.y * (1.0 - fres) * sun_spec;
+        // The sun-directed water terms all carry input.light.y (crest transmission, the
+        // glint, the sparkle): where skylight is exactly zero — cave pools, Nether water,
+        // full roofing — this branch deletes the two shines, the sqrt and the hash that
+        // were computing exact zeros. The sun verdict above stays OUT of this gate: the
+        // foam's white rides sun_diff with no light.y factor of its own.
+        if input.light.y > 0.0 {
+            // light through the thin water at a crest, the cheap subsurface term Seascape uses
+            color += vec3<f32>(0.05, 0.18, 0.20) * lm_w * crest_h * 0.35 * input.light.y * (1.0 - fres) * sun_spec;
 
-        // the sun's path across the chop. The exponent widens with distance and the gain
-        // falls, so far glitter does not alias into sparkle; clamped so it can never
-        // become a broad face-painting wash on the water.
-        if specular > 0.0 && light_dir.y > 0.0 {
-            let gd = max(dist, 2.0);
-            let s = clamp(1.0 - sqrt(gd / 450.0), 0.62, 0.90);
-            let gain = 0.5 / (1.0 + gd * 0.012);
-            let glint = shine(nw, light_dir, view, s) * input.light.y * specular * gain * sun_spec;
-            color += vec3<f32>(glint) * mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.3);
+            // the sun's path across the chop. The exponent widens with distance and the gain
+            // falls, so far glitter does not alias into sparkle; clamped so it can never
+            // become a broad face-painting wash on the water.
+            if specular > 0.0 && light_dir.y > 0.0 {
+                let gd = max(dist, 2.0);
+                let s = clamp(1.0 - sqrt(gd / 450.0), 0.62, 0.90);
+                let gain = 0.5 / (1.0 + gd * 0.012);
+                let glint = shine(nw, light_dir, view, s) * input.light.y * specular * gain * sun_spec;
+                color += vec3<f32>(glint) * mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.3);
 
-            // Sparkle: discrete facets here and there catch full sun and go white for a
-            // beat. Cells are world-fixed and re-rolled fifteen times a second (facet
-            // geometry genuinely turns over about that fast), and only crest-top cells
-            // qualify, so the path leads the chop instead of snowing on top of it.
-            if sparkle > 0.0 {
-                let sc = floor(world.xz * 6.0);
-                let hf = unit(h21(u32(i32(sc.x)) ^ 0x45D9u,
-                                  (u32(i32(sc.y)) * 2u + 7u) ^ (u32(frame.time * 15.0) * 2246822519u)));
-                let facet = smoothstep(0.984, 1.0, hf);
-                let oncrest = clamp(length(slope) * 4.5 - 0.35, 0.0, 1.0);
-                let hit = shine(nw, light_dir, view, 0.985);
-                color += vec3<f32>(1.0, 0.96, 0.88) * facet * oncrest * hit
-                       * input.light.y * specular * gain * 7.0 * sparkle * sun_spec;
+                // Sparkle: discrete facets here and there catch full sun and go white for a
+                // beat. Cells are world-fixed and re-rolled fifteen times a second (facet
+                // geometry genuinely turns over about that fast), and only crest-top cells
+                // qualify, so the path leads the chop instead of snowing on top of it.
+                if sparkle > 0.0 {
+                    let sc = floor(world.xz * 6.0);
+                    let hf = unit(h21(u32(i32(sc.x)) ^ 0x45D9u,
+                                      (u32(i32(sc.y)) * 2u + 7u) ^ (u32(frame.time * 15.0) * 2246822519u)));
+                    let facet = smoothstep(0.984, 1.0, hf);
+                    let oncrest = clamp(slen * 4.5 - 0.35, 0.0, 1.0);
+                    if facet > 0.0 && oncrest > 0.0 {
+                        // smoothstep clamps to an exact zero below its edge: ~98% of cells are
+                        // facet-killed, most of the rest crest-killed; only survivors pay a shine.
+                        let hit = shine(nw, light_dir, view, 0.985);
+                        color += vec3<f32>(1.0, 0.96, 0.88) * facet * oncrest * hit
+                               * input.light.y * specular * gain * 7.0 * sparkle * sun_spec;
+                    }
+                }
             }
         }
         // soft intersection: the water fades out where it meets the shore, no hard line
@@ -408,6 +447,112 @@ fn material(input: MaterialInput) -> Surface {
         // water is not solid terrain: leave the post stage's surface buffer alone
         return Surface(vec4<f32>(max(color, vec3<f32>(0.0)), alpha));
     }
+
+
+    let pbr = block_pbr_maps();
+    var n = n_geo;
+    var smoothness = 0.0;
+    var f0 = 0.0;
+    var spec_tint = vec3<f32>(1.0);
+    var emission_map = 0.0;
+    if pbr {
+        // all reads inside the branch: with no LabPBR pack installed they cost nothing
+        let spec_map = block_specular_map(input.uv);
+        n = mapped_normal(n_geo, input.tangent, block_normal_map(input.uv));
+        smoothness = spec_map.r;
+        emission_map = spec_map.a;
+        // LabPBR green is the reflectance: F0 up to 229/255 for dielectrics,
+        // 230-254 the preset metals, 255 the albedo-as-F0 metal. Every
+        // highlight must ride it. Reading only red gave every sunlit face a
+        // half-strength broad lobe regardless of what the material is — the
+        // tonemap clipped that to pale (owner: "everything gettin hit by the
+        // sun is mad washed out"). SPBR ships stone/dirt/wood at F0 0, so
+        // those faces now add nothing. Preset metals share one strength and
+        // take the albedo as their highlight tint per the metal convention;
+        // the per-metal N/K tables are not modeled.
+        let g = spec_map.g;
+        f0 = select(g, 0.9, g > 0.9 && g < 0.996);
+        spec_tint = mix(vec3<f32>(1.0), input.albedo.rgb, step(0.9, g));
+    }
+
+    // vanilla's lit colour, in linear light
+    let base = input.albedo.rgb * input.shaded_tint.rgb;
+    var color = base * input.lightmap;
+
+    // coloured block light: shift the hue of the block-lit part, keep its brightness
+    // the light grid is a trilinear 3D sample, eight fetches: skip it where no block
+    // light reaches, which is most of a daylit surface. The engine's colour grid is
+    // a 128-block cube around the camera that samples 0 outside, and its edge sits
+    // anywhere from 48 to 64 blocks out, snapping 16 blocks whenever the cube
+    // recentres — so the hue is faded in over the last stretch before 48, the
+    // closest that edge ever gets. Then it fades with distance instead of switching
+    // on at the cube's wall, however the cube moves.
+    let gf = min(min(1.0 - smoothstep(40.0, 48.0, abs(input.position.x)),
+                     1.0 - smoothstep(40.0, 48.0, abs(input.position.y))),
+                 1.0 - smoothstep(40.0, 48.0, abs(input.position.z)));
+    if colored_light > 0.0 && input.light.x > 0.01 && gf > 0.0 {
+        let cl = block_light_color(input.position);
+        // cl.a is the engine's own proximity term: (1 - d/level)^2 summed over
+        // the lights that reach here — continuous in distance. sqrt brings it
+        // back to a linear falloff. The hue rode on input.light.x alone, which
+        // is the light engine's integer level dropping one full 1/15 rung per
+        // block: that is the step. Riding the proximity curve instead lets the
+        // torch's colour fade in while you walk to the flame; light.x stays as
+        // the gate that the surface is block-lit at all.
+        let near = sqrt(min(cl.a, 1.0));
+        let tint = mix(vec3<f32>(1.0), cl.rgb, near * colored_light);
+        color += base * near * gf * (tint - vec3<f32>(1.0));
+    }
+    // the engine's carried block lights — held and dropped items, and any
+    // [[particle_lights]] or mod lights upstream — ride in as a hue shift
+    if any(input.colored_light > vec3<f32>(0.0)) {
+        color = mix(color, color * (vec3<f32>(1.0) + input.colored_light), 0.5);
+    }
+
+    // the sun's or moon's highlight where the sky reaches the surface
+    if specular > 0.0 && light_dir.y > 0.0 {
+        // Specular only where a normal map gives variation inside a face: a block face
+        // has a flat normal, so a highlight is near-constant across it and paints the
+        // whole face pale. Water keeps its glint because the wave field varies the
+        // normal per fragment.
+        // LabPBR's own channels decide: smoothness sets the lobe width, F0
+        // the strength. A gate on f0 > 0.0 skips zero-F0 sprites wholesale —
+        // the skipped face's continuation is exactly what an F0 of 0 added,
+        // so no boundary can render.
+        if smoothness > 0.02 && f0 > 0.0 {
+            let sun_tint = mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.35);
+            let glint = shine(n, light_dir, view, smoothness) * input.light.y * specular;
+            color += spec_tint * (glint * f0 * 0.5) * sun_tint;
+        }
+    }
+
+    // LabPBR's per-texel emission: glowing ore, a lamp's filament
+    if emission_map > 0.0 {
+        color += base * emission_map * 0.5;
+    }
+
+    // Ore glow: the manifest names the fourteen glowing sprites outright
+    // (coal and the nether ores are deliberately outside the list), so this
+    // is a block-class lookup, not a color guess. Gate and add read the raw
+    // texture, not base: base carries the per-face shade and AO, and a
+    // "self"-light that swings 3x with face orientation is the wrong law
+    // (measured at the 0.16.39 review). The add is the texel's own color
+    // times its chroma: saturated flecks brighten toward the bloom knee
+    // (post/bloom_bright.wgsl — diamond, gold and emerald cross it and halo;
+    // the pale sprites glow without one until the slider lifts them over),
+    // the stone or deepslate host gates out, and the hue carries itself with
+    // no per-ore table. Gate floor 0.05 sits a quarter above the warmest
+    // overworld host texel measured (0.0375, deepslate redstone). Where a
+    // LabPBR pack already emits through the block above, this adds only the
+    // excess over that emission: never a stack, and no per-texel handoff on
+    // the smallest step of an 8-bit channel.
+    if ore_glow > 0.0 && input.material == 8u {
+        let lit = input.albedo.rgb;
+        let fleck = smoothstep(0.05, 0.25,
+            max(lit.r, max(lit.g, lit.b)) - min(lit.r, min(lit.g, lit.b)));
+        color += lit * max(ore_glow * fleck - emission_map * 0.5, 0.0);
+    }
+
 
     if !input.translucent {
         // what the post passes read: world normal, smoothness, and the sky light as our own data

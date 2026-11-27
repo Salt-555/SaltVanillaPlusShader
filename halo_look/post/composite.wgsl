@@ -28,14 +28,18 @@ fn scene_at(p: vec2<i32>) -> vec3<f32> {
 fn smooth_edges(uv: vec2<f32>, c: vec3<f32>, cn: vec3<f32>, cs: vec3<f32>,
                 cw: vec3<f32>, ce: vec3<f32>) -> vec3<f32> {
     let lc = luma(c);
-    let lo = min(lc, min(min(luma(cn), luma(cs)), min(luma(cw), luma(ce))));
-    let hi = max(lc, max(max(luma(cn), luma(cs)), max(luma(cw), luma(ce))));
+    let ln = luma(cn);
+    let ls = luma(cs);
+    let lw = luma(cw);
+    let le = luma(ce);
+    let lo = min(lc, min(min(ln, ls), min(lw, le)));
+    let hi = max(lc, max(max(ln, ls), max(lw, le)));
     let range = hi - lo;
     if range < max(0.0312, hi * 0.125) {
         return c;
     }
     let px = 1.0 / frame.resolution;
-    let grad = vec2<f32>(luma(cw) - luma(ce), luma(cn) - luma(cs));
+    let grad = vec2<f32>(lw - le, ln - ls);
     let gl = max(length(grad), 1e-5);
     let along = vec2<f32>(-grad.y, grad.x) / gl;   // along the edge, across the gradient
     let step = along * px * 1.5;
@@ -63,12 +67,15 @@ fn post(input: PostInput) -> vec4<f32> {
         c = smooth_edges(input.uv, c, cn, cs, cw, ce);
     }
     c *= textureSampleLevel(shade_buf, linear_sampler, input.uv, 0.0).rgb;
+    // Sun shafts ride inside the bloom since 0.16.42: glow_blur arrives with
+    // rays_hist already summed into it by the blur's vertical leg (quarter-res
+    // grid, ahead of it in manifest order), so the two quarter-res additive
+    // fields cost THIS ONE full-res sample. Bilinear filtering is linear, so
+    // summing at quarter res instead of here re-quantizes the sum once and
+    // nothing else; both producers still write exact black when off or gated,
+    // so the add stays always safe and often free. (The raw god_halo is the
+    // accumulator's input, never sampled here directly.)
     c += textureSampleLevel(glow_blur, linear_sampler, input.uv, 0.0).rgb;
-    // Sun shafts: rays_hist is post/rays_accum.wgsl's accumulated target (both
-    // it and the march write black when off or gated, so this add is always
-    // safe and often free). The raw quarter-res god_halo is the accumulator's
-    // input now, never sampled here directly).
-    c += textureSampleLevel(rays_hist, linear_sampler, input.uv, 0.0).rgb;
 
     // Ground fog: a shallow world-height band with a slow noise field, so mist pools
     // in valleys and drapes across the lake instead of hazing the whole screen. The
@@ -80,8 +87,11 @@ fn post(input: PostInput) -> vec4<f32> {
             let fpos = view_position(input.uv, fdepth);
             let wy = frame.camera_position.y + fpos.y;
             let below = max(fog_line - wy, 0.0);
-            let fdist = length(fpos);
-            if below > 0.25 && fdist > 3.0 {
+            // fdist's sqrt feeds nothing above the fog line, so it is paid
+            // below it (0.16.42).
+            if below > 0.25 {
+                let fdist = length(fpos);
+                if fdist > 3.0 {
                 let sun0 = frame.sun_direction;
                 // Grade and fog cool slower (2.0) than stars and shafts arrive
                 // (sky and god_rays use 2.4): dusk keeps a warm beat before the silver.
@@ -101,7 +111,13 @@ fn post(input: PostInput) -> vec4<f32> {
                 // The near-duplicate is forced: shared files compile into every
                 // stage, and the sky, vertex, weather and tonemap preludes carry
                 // no shadow bindings.
-                var moonlit = pow(max(dot(normalize(fpos), frame.moon_direction), 0.0), 5.0) * night0;
+                var moonlit = 0.0;
+                // Daytime (night0 == 0) makes the lobe exactly +0.0, so it is
+                // skipped rather than added — and the cosine comes from the
+                // fdist already in hand instead of a second normalize (0.16.42).
+                if night0 > 0.0 {
+                    moonlit = pow(max(dot(fpos, frame.moon_direction) / fdist, 0.0), 5.0) * night0;
+                }
                 if night0 > 0.05 && moonlit > 0.0 && frame.has_shadow == 1u {
                     let texel = max(frame.shadow_center_texel, 0.01);
                     let sp = shadow_position(fpos + frame.light_direction * (texel * 1.5));
@@ -115,6 +131,7 @@ fn post(input: PostInput) -> vec4<f32> {
                 let dens = clamp(f * (0.55 + 0.45 * n) + f * moonlit * 0.55, 0.0, 0.90);
                 c = mix(c, c * 0.75 + vec3<f32>(0.016, 0.020, 0.032) * (0.3 + 0.7 * night0)
                              + vec3<f32>(0.055, 0.075, 0.13) * moonlit, dens);
+                }
             }
         }
     }
@@ -156,9 +173,13 @@ fn post(input: PostInput) -> vec4<f32> {
     if vignette {
         let d = length(input.uv - vec2<f32>(0.5));
         let v = smoothstep(0.42, 0.92, d);
-        c *= 1.0 - v * 0.24;
-        // the darkened edge runs a hair cold: reads as lens glass, not as dirt on a screen
-        c = mix(c, vec3<f32>(luma(c)) * vec3<f32>(0.90, 0.95, 1.12), v * 0.30);
+        // smoothstep clamps to 0 inside a 0.42-radius ellipse (~55% of the
+        // frame), and at v == 0 the body below is the exact identity (0.16.42).
+        if v > 0.0 {
+            c *= 1.0 - v * 0.24;
+            // the darkened edge runs a hair cold: reads as lens glass, not as dirt on a screen
+            c = mix(c, vec3<f32>(luma(c)) * vec3<f32>(0.90, 0.95, 1.12), v * 0.30);
+        }
     }
 
     // Film grain: re-rolls at twelve steps a second (a film shutter's cadence, not a

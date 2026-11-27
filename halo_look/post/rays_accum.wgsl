@@ -44,10 +44,11 @@ fn post(input: PostInput) -> vec4<f32> {
     // accumulating black. Past the fan's reach the clamp box annihilates
     // history in one frame anyway; skipping the reads here keeps most of the
     // screen free when facing away from the light.
-    let k = 0.68;
-    let mu = dot(ray_dir(input.uv), light);
-    let floor_ = pow((1.0 - k) / (1.0 + k), 3.0);
-    let glow = (pow((1.0 - k) / max(1.0 - k * mu, 0.02), 3.0) - floor_) / (1.0 - floor_);
+    let rd = ray_dir(input.uv);
+    let mu = dot(rd, light);
+    // The march's lobe, shared constants (common.wgsl): folded, cube form.
+    let lw = 0.32 / max(1.0 - LOBE_K * mu, 0.02);
+    let glow = (lw * lw * lw) * LOBE_C1 - LOBE_C0;
     if glow * strength < 0.0008 {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
@@ -57,8 +58,14 @@ fn post(input: PostInput) -> vec4<f32> {
     // sky. Direction-anchored sky content rides a fixed-direction point
     // through rotation exactly, and one frame of translation is nothing
     // against 400 blocks.
-    let here = select(view_position(input.uv, depth),
-                      ray_dir(input.uv) * 400.0, depth == 0.0);
+    // Branch, not select: select evaluates BOTH operands, so every sky cell (the
+    // majority of a sun-facing frame) would pay view_position to throw it away.
+    var here: vec3<f32>;
+    if depth == 0.0 {
+        here = rd * 400.0;
+    } else {
+        here = view_position(input.uv, depth);
+    }
     let clip = frame.previous_view_projection * vec4<f32>(here + frame.camera_motion, 1.0);
     let front = clip.w > 1.0e-3;
     let ndc = vec2<f32>(clip.x, clip.y) / max(abs(clip.w), 1.0e-3);
@@ -71,7 +78,7 @@ fn post(input: PostInput) -> vec4<f32> {
     let dt = frame.delta_time;
     var keep = 0.78;
     if dt > 0.0 {
-        keep = pow(0.78, dt * 60.0);
+        keep = exp2(dt * KEEP_K);   // pow(0.78, dt*60) folded (KEEP_K, common.wgsl)
     }
     if frame.reset_reasons != 0u || dt <= 0.0
         || length(frame.camera_motion) > 21.0 * max(dt, 1.0e-3) || !on {

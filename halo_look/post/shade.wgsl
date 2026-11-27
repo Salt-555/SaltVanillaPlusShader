@@ -7,6 +7,27 @@ override shadows: bool = true;
 override shadow_softness: f32 = 0.0;
 override contact_ao: f32 = 0.5;
 
+// One contact-AO ring tap for the hand-unrolled ring (see the call sites): a
+// neighbour's depth load and its occlusion contribution. 0.0 is exactly what the
+// old loop's skipped branches added (0.16.42).
+fn ao_tap(uv: vec2<f32>, ring: vec2<f32>, dsize: vec2<f32>,
+          pos: vec3<f32>, normal: vec3<f32>, bearing: vec2<f32>) -> f32 {
+    let suv = uv + bearing * ring;
+    // Index-domain clamp, the pack-wide convention: a rail-riding tap reads the
+    // edge texel instead of stepping one past the last one (0.16.43).
+    let sidx = clamp(vec2<i32>(suv * dsize), vec2<i32>(0, 0), vec2<i32>(dsize) - vec2<i32>(1, 1));
+    let sd = textureLoad(scene_depth, sidx, 0);
+    if sd == 0.0 {
+        return 0.0;
+    }
+    let d = view_position(suv, sd) - pos;
+    let dist = length(d);
+    if dist <= 0.001 {
+        return 0.0;
+    }
+    return clamp(dot(normal, d / dist) - 0.15, 0.0, 1.0) * clamp(1.0 - dist / 1.2, 0.0, 1.0);
+}
+
 fn post(input: PostInput) -> vec4<f32> {
     let white = vec4<f32>(1.0);
     let depth = depth_at(input.uv);
@@ -69,7 +90,10 @@ fn post(input: PostInput) -> vec4<f32> {
                 let trans_lit = textureSampleCompareLevel(shadow_map_translucent, shadow_sampler, p.xy, p.z);
                 if trans_lit < 0.5 {
                     let dim = vec2<f32>(textureDimensions(shadow_color));
-                    let sc = textureLoad(shadow_color, vec2<i32>(p.xy * dim), 0);
+                    // Same index-domain clamp as ao_tap: the fade band lets p.xy
+                    // reach the map's rails (0.16.43).
+                    let cidx = clamp(vec2<i32>(p.xy * dim), vec2<i32>(0, 0), vec2<i32>(dim) - vec2<i32>(1, 1));
+                    let sc = textureLoad(shadow_color, cidx, 0);
                     shade *= mix(vec3<f32>(1.0), sc.rgb, clamp(sc.a, 0.0, 1.0) * strength);
                 }
             }
@@ -83,20 +107,16 @@ fn post(input: PostInput) -> vec4<f32> {
     if contact_ao > 0.001 && ao_fade > 0.001 {
         let dsize = vec2<f32>(textureDimensions(scene_depth));
         let ring = clamp(24.0 / max(away, 0.5), 2.0, 16.0) / dsize;
+        // Six literal bearing vectors — the exact f32 values the loop's cos/sin
+        // produced — replace twelve runtime trig calls per AO pixel and the
+        // driver's unroll bet (0.16.42).
         var occ = 0.0;
-        for (var i = 0; i < 6; i++) {
-            let a = f32(i) * 1.0471976;
-            let suv = clamp(input.uv + vec2<f32>(cos(a), sin(a)) * ring, vec2<f32>(0.0), vec2<f32>(1.0));
-            let sd = textureLoad(scene_depth, vec2<i32>(suv * dsize), 0);
-            if sd != 0.0 {
-                let d = view_position(suv, sd) - pos;
-                let dist = length(d);
-                if dist > 0.001 {
-                    occ += clamp(dot(s.normal, d / dist) - 0.15, 0.0, 1.0)
-                         * clamp(1.0 - dist / 1.2, 0.0, 1.0);
-                }
-            }
-        }
+        occ += ao_tap(input.uv, ring, dsize, pos, s.normal, vec2<f32>(1.0, 0.0));
+        occ += ao_tap(input.uv, ring, dsize, pos, s.normal, vec2<f32>(0.4999999701976776, 0.866025447845459));
+        occ += ao_tap(input.uv, ring, dsize, pos, s.normal, vec2<f32>(-0.5000000596046448, 0.8660253882408142));
+        occ += ao_tap(input.uv, ring, dsize, pos, s.normal, vec2<f32>(-1.0, -8.742277657347586e-08));
+        occ += ao_tap(input.uv, ring, dsize, pos, s.normal, vec2<f32>(-0.49999991059303284, -0.866025447845459));
+        occ += ao_tap(input.uv, ring, dsize, pos, s.normal, vec2<f32>(0.49999991059303284, -0.866025447845459));
         shade *= 1.0 - clamp(occ / 6.0, 0.0, 1.0) * contact_ao * 0.65 * ao_fade;
     }
 
