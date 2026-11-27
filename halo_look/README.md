@@ -1,4 +1,4 @@
-# Halo Look 0.17.5
+# Halo Look 0.17.6
 
 A Horizon shader pack (shader API 0.2, WGSL) for the Strix Halo APU. No ray tracing: the
 shadow is a shadow map, the water mirror is a planar reflection, everything else is
@@ -155,7 +155,7 @@ square is drawn again each frame).
 ## Build, check, install
 
     horizon-shader check .
-    horizon-shader pack .          # writes halo_look-0.17.5.hshader
+    horizon-shader pack .          # writes halo_look-0.17.6.hshader
 
 Copy the folder or the `.hshader` into `shaderpacks/` beside `options.txt`.
 `HORIZON_SHADER_PACK=halo_look` forces it for development. A saved pack is re-checked twice a
