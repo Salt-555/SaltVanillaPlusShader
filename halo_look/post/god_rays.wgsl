@@ -170,13 +170,6 @@ fn post(input: PostInput) -> vec4<f32> {
         let daxis = max(abs(dir.x), abs(dir.z));
         let dims = vec2<i32>(textureDimensions(shadow_map));
         var lit_sum = 0.0;
-        var w_sum = 0.0;
-        // Extinction weighting (GPU Gems 3 ch.13 in-scatter): distant air
-        // eats the light a step contributes, so near coverage must not be
-        // averaged flat with far. DENSITY is the weather hook: rain thickens
-        // the air, which grades the beams and (via the amp below) brightens
-        // them - weather could not touch shafts at all before.
-        let dens = 0.006 * (1.0 + 1.2 * frame.rain);
         for (var i = 0u; i < 4u; i = i + 1u) {
             let fi = f32(i);
             // Per-step offsets decorrelate the coverage samples, so the mean
@@ -221,15 +214,9 @@ fn post(input: PostInput) -> vec4<f32> {
             // fully cover the light. Surfaces fade to true shadow; the sky keeps
             // the 0.30 aerial floor because there is no occluder to be honest
             // about, and the fade still never draws an edge.
-            // w: this step's share of the in-scatter integral. The beam stays
-            // a MEAN (sum/weight-sum) so overall brightness does not drift
-            // with weather - the weighting grades WITHIN the beam; the amp's
-            // path factor and rain term carry the between-path response.
-            let wgt = exp(-dens * t);
-            lit_sum += mix(s2, select(0.30, 0.0, !over_sky), past) * wgt;
-            w_sum += wgt;
+            lit_sum += mix(s2, select(0.30, 0.0, !over_sky), past);
         }
-        beam = lit_sum / max(w_sum, 1.0e-4);
+        beam = lit_sum / 4.0;
     }
 
     let low = 1.0 - clamp(light.y * 1.6, 0.0, 1.0);
@@ -240,17 +227,7 @@ fn post(input: PostInput) -> vec4<f32> {
     // and the cut pattern IS the shaft structure. The glow rides the verdict:
     // opaque geometry covering the light must fully occlude the flare, not keep a
     // 15% floor of it (that leaked the halo through cliffs).
-    // The path factor replaces the old select(0.42, 0.24, over_sky), which
-    // PENALIZED the longest lit paths - the review ledger's own words: it
-    // "discounts the direction real crepuscular rays are brightest in".
-    // Physics: in-scatter grows with the length of illuminated air the eye
-    // collects along the ray, so the factor rides the marched length (sky
-    // rays march the full reach). The band keeps today's look near the
-    // middle and lifts only the long grazing paths. Rain's amp term thickens
-    // visible beams with the same dens the loop weights with.
     let amp = strength * glow * beam * bail
-            * (0.55 + 0.45 * light.y)
-            * (0.28 + 0.24 * min(march / reach, 1.0))
-            * (1.0 + 0.7 * frame.rain);
+            * (0.55 + 0.45 * light.y) * select(0.42, 0.24, over_sky);
     return vec4<f32>(tint * amp, 1.0);
 }
