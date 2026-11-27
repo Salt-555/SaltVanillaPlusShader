@@ -599,7 +599,11 @@ fn material(input: MaterialInput) -> Surface {
         let backlit = max(-dot(n, light_dir), 0.0);
         let back = max(dot(light_dir, -view), 0.0);
         let trans = pow(back, 4.0) * backlit * sss * sss_back * 0.5 * input.light.y;
-        color += input.albedo.rgb * mix(vec3<f32>(1.0), frame.sky_color * 2.0, 0.35) * trans;
+        // The light passing through is SUNlight, not skylight: a warm
+        // white. The pack's sky_color-tinted convention reads blue on a
+        // broad glow (owner: "the glow through the trees is also
+        // blueish"); the leaf's own color comes in via albedo anyway.
+        color += input.albedo.rgb * vec3<f32>(1.0, 0.86, 0.66) * trans;
     }
 
     // LabPBR's per-texel emission: glowing ore, a lamp's filament
